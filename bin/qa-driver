@@ -1,0 +1,541 @@
+#!/usr/bin/env python3
+"""qa-driver — one QA parent ticket: pick its open child tickets, give each its own worktree, start a coordinator there.
+
+    qa-driver init     <PARENT>                       state directory with config.env / context.md skeletons
+    qa-driver run      <PARENT> [--dry-run|--pending] one round: select tickets, drive each (scheduler entry point)
+    qa-driver drive    <PARENT> <KEY>                 one ticket: worktree (created or reused) + coordinator terminal
+    qa-driver worker   <PARENT> <KEY> <SUBMODULE>     coordinator only: worker terminal in the same worktree
+    qa-driver status   <PARENT> [--json]              stage of every claimed ticket (exports/state-contract.md)
+    qa-driver approve  <PARENT> <KEY> [--force]       record push/PR approval and tell the coordinator
+    qa-driver cleanup  <PARENT> <KEY> [--force|--dry-run]  deinit submodules and remove the ticket worktree
+    qa-driver ignore   <PARENT> <KEY> [--undo]        keep a ticket out of selection
+
+State lives in $QA_DRIVER_HOME/<parent in lower case>/ (default ~/.qa-driver). --home <dir> points at another home,
+e.g. an older watcher's. Python 3 standard library only; needs the `orca` CLI and git.
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+import base64
+
+SKILL_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+REF = os.path.join(SKILL_DIR, "references")
+SIGNALS = ("handoffs", "done", "ready", "blocked", "approved", "delivered")  # moved to rounds/ on a reopen
+
+
+def die(msg, code=1):
+    print(f"qa-driver: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def now():
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ---------- state directory and config ----------
+class State:
+    def __init__(self, parent, home=None):
+        self.parent = parent
+        self.home = os.path.expanduser(home or os.environ.get("QA_DRIVER_HOME") or "~/.qa-driver")
+        self.dir = os.path.join(self.home, parent.lower())
+        self.cfg = {}
+
+    def p(self, *parts):
+        return os.path.join(self.dir, *parts)
+
+    def load(self, need=()):
+        path = self.p("config.env")
+        if not os.path.isfile(path):
+            die(f"{path} 없음 — 먼저 qa-driver init {self.parent}")
+        for line in open(path, encoding="utf-8"):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            v = shlex.split(v, comments=True)
+            self.cfg[k.strip()] = os.path.expandvars(os.path.expanduser(v[0])) if v else ""
+        for k in need:
+            if not self.get(k):
+                die(f"config.env 에 {k} 가 없다 (references/config.env.example)")
+        return self
+
+    def get(self, k, default=""):
+        return self.cfg.get(k) or os.environ.get(k) or default
+
+    def ticket(self, key):
+        try:
+            with open(self.p("tickets", f"{key}.json"), encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {"key": key}
+
+    def save_ticket(self, t):
+        os.makedirs(self.p("tickets"), exist_ok=True)
+        t["updated_at"] = now()
+        tmp = self.p("tickets", f'{t["key"]}.json.tmp')
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(t, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, self.p("tickets", f'{t["key"]}.json'))
+
+    def claims(self, key):
+        try:
+            return [l.rstrip("\n").split("\t") for l in open(self.p("claimed", key), encoding="utf-8") if l.strip()]
+        except OSError:
+            return []
+
+    def has(self, kind, key):
+        """A signal file of this ticket: <kind>/<KEY>.md or a per-repo <kind>/<KEY>-<repo>.md (not a .roundN copy)."""
+        d = self.p(kind)
+        if not os.path.isdir(d):
+            return []
+        pat = re.compile(rf"^{re.escape(key)}(?:-[^.]+)?(?:\.md)?$")
+        return sorted(f for f in os.listdir(d) if pat.match(f))
+
+
+class Lock:
+    def __init__(self, st):
+        self.path = st.p(".lock")
+
+    def __enter__(self):
+        for _ in range(60):
+            try:
+                os.mkdir(self.path)
+                return self
+            except FileExistsError:
+                time.sleep(2)
+        die(f"{self.path} 를 2분째 다른 회차가 잡고 있다 (도는 회차가 없으면 손으로 지운다)")
+
+    def __exit__(self, *a):
+        try:
+            os.rmdir(self.path)
+        except OSError:
+            pass
+
+
+def log(st, msg):
+    os.makedirs(st.p("log"), exist_ok=True)
+    line = f"[{now()}] {msg}"
+    print(line)
+    with open(st.p("log", datetime.date.today().strftime("%Y%m%d") + ".log"), "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+# ---------- outside tools ----------
+def orca(*args, timeout=60):
+    r = subprocess.run(["orca", *args, "--json"], capture_output=True, text=True, timeout=timeout)
+    try:
+        d = json.loads(r.stdout)
+    except ValueError:
+        raise RuntimeError((r.stdout or r.stderr).strip()[:300])
+    if d.get("ok") is not True:
+        raise RuntimeError(json.dumps(d.get("error") or d, ensure_ascii=False)[:300])
+    return d.get("result") or {}
+
+
+def find(node, key):
+    """First value of `key` anywhere in a JSON tree."""
+    if isinstance(node, dict):
+        if isinstance(node.get(key), str):
+            return node[key]
+        node = list(node.values())
+    if isinstance(node, list):
+        for c in node:
+            v = find(c, key)
+            if v:
+                return v
+    return None
+
+
+def git(path, *args, timeout=60):
+    r = subprocess.run(["git", "-C", path, *args], capture_output=True, text=True, timeout=timeout)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def jira_token(st):
+    t = os.environ.get("ATLASSIAN_API_TOKEN") or st.get("ATLASSIAN_API_TOKEN")
+    svc = st.get("QA_JIRA_TOKEN_KEYCHAIN_SERVICE")
+    if not t and svc:
+        r = subprocess.run(["security", "find-generic-password", "-s", svc, "-w"], capture_output=True, text=True)
+        t = r.stdout.strip()
+    if not t:
+        die("Jira 토큰 없음 — ATLASSIAN_API_TOKEN 또는 config.env QA_JIRA_TOKEN_KEYCHAIN_SERVICE")
+    return t
+
+
+def jira_open_children(st):
+    """[(key, status, last reopen epoch, summary)] for the parent's tickets in the new / reopen states."""
+    new, reopen = st.get("QA_STATUS_NEW", "To Do"), st.get("QA_STATUS_REOPEN", "Reopened")
+    jql = st.get("QA_JQL") or f'parent = {st.parent} AND status IN ("{new}", "{reopen}") ORDER BY created ASC'
+    auth = base64.b64encode(f'{st.get("JIRA_EMAIL")}:{jira_token(st)}'.encode()).decode()
+    site = st.get("JIRA_SITE").removeprefix("https://").rstrip("/")
+    out, nxt = [], None
+    while True:
+        q = {"jql": jql, "fields": "summary,status", "expand": "changelog", "maxResults": "100"}
+        if nxt:
+            q["nextPageToken"] = nxt
+        req = Request(f"https://{site}/rest/api/3/search/jql?{urlencode(q)}",
+                      headers={"Authorization": "Basic " + auth, "Accept": "application/json"})
+        with urlopen(req, timeout=30) as r:
+            d = json.load(r)
+        for i in d.get("issues") or []:
+            last = 0
+            for h in (i.get("changelog") or {}).get("histories") or []:
+                if any(it.get("field") == "status" and it.get("toString") == reopen for it in h.get("items") or []):
+                    ts = datetime.datetime.strptime(h["created"], "%Y-%m-%dT%H:%M:%S.%f%z").timestamp()
+                    last = max(last, int(ts))
+            out.append((i["key"], i["fields"]["status"]["name"], last, (i["fields"].get("summary") or "").replace("\t", " ")))
+        nxt = d.get("nextPageToken")
+        if not nxt or d.get("isLast", True):
+            return out, reopen
+
+
+# ---------- stages (exports/state-contract.md) ----------
+STAGES = ["selected", "worktree", "analysis", "implementing", "reviewing", "committed", "approved", "delivered", "cleaned"]
+
+
+def stage_of(st, key):
+    if os.path.exists(st.p("cleaned", key)):
+        return "cleaned"
+    for kind, stage in (("delivered", "delivered"), ("approved", "approved"), ("ready", "committed")):
+        if f"{key}.md" in st.has(kind, key):
+            return stage
+    hand = [f for f in st.has("handoffs", key) if not f.endswith("-deliver.md")]
+    done = st.has("done", key)
+    if hand and done and len(done) >= len(hand):
+        return "reviewing"
+    if hand:
+        return "implementing"
+    t = st.ticket(key)
+    if t.get("coordinator") or (not t.get("driver") and st.claims(key)):  # an older watcher keeps no ticket record
+        return "analysis"
+    return "worktree" if t.get("worktree") else "selected"
+
+
+def status_rows(st):
+    rows = []
+    for key in sorted(os.listdir(st.p("claimed")) if os.path.isdir(st.p("claimed")) else [], key=lambda k: int(re.sub(r"\D", "", k) or 0)):
+        t, cl = st.ticket(key), st.claims(key)
+        rows.append({"key": key, "stage": stage_of(st, key), "blocked": bool(st.has("blocked", key)),
+                     "ignored": os.path.exists(st.p("ignored", key)), "round": len(cl),
+                     "claimed_at": cl[-1][0] if cl else None, "worktree": (t.get("worktree") or {}).get("path"),
+                     "coordinator": (t.get("coordinator") or {}).get("handle") or (cl[-1][2] if cl and len(cl[-1]) > 2 else None),
+                     "workers": t.get("workers") or {}, "summary": t.get("summary") or (cl[-1][3] if cl and len(cl[-1]) > 3 else "")})
+    return rows
+
+
+def active(st):
+    return [r for r in status_rows(st) if r["stage"] not in ("delivered", "cleaned") and not r["blocked"] and not r["ignored"]]
+
+
+# ---------- briefs ----------
+def render(st, out, templates, key, extra=None):
+    ctx_path = st.p("context.md")
+    ctx = open(ctx_path, encoding="utf-8").read().strip() if os.path.isfile(ctx_path) else "(기능 맥락 파일이 없다 — 사용자에게 묻는다.)"
+    vals = {"KEY": key, "PARENT_KEY": st.parent, "STATE_DIR": st.dir, "TODAY": datetime.date.today().isoformat(),
+            "RECORD_DIR": st.get("QA_RECORD_DIR", st.p("records")), "AUTO_HANDOFF": st.get("QA_AUTO_HANDOFF"),
+            "REPO": st.get("QA_REPO"), "JIRA_SITE": st.get("JIRA_SITE").removeprefix("https://").rstrip("/"),
+            "JIRA_EMAIL": st.get("JIRA_EMAIL"), "HARNESS_DOCS": st.get("QA_HARNESS_DOCS", "AGENTS.md"),
+            "TICKET_SKILLS": st.get("QA_TICKET_SKILLS") or "(없음 — 하네스 문서의 규칙을 따른다)",
+            "DRIVER": os.path.join(SKILL_DIR, "bin", "qa-driver"), "HOME_OPT": f'--home "{st.home}"',
+            "TOKEN_HINT": f'`security find-generic-password -s {st.get("QA_JIRA_TOKEN_KEYCHAIN_SERVICE")} -w`'
+            if st.get("QA_JIRA_TOKEN_KEYCHAIN_SERVICE") else "사용자에게 묻는다", **(extra or {})}
+    text = "\n\n---\n\n".join(open(os.path.join(REF, t), encoding="utf-8").read() for t in templates)
+    text = text.replace("@@CONTEXT@@", ctx)
+
+    def sub(m):
+        if m.group(1) not in vals:
+            die(f"치환되지 않은 자리표시자 @@{m.group(1)}@@")
+        return str(vals[m.group(1)])
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(re.sub(r"@@([A-Z_]+)@@", sub, text))
+    return out
+
+
+def start_agent(st, worktree, title, prompt_file, intro):
+    """New terminal in the worktree running the agent; sends 'read this file'. -> handle."""
+    res = orca("terminal", "create", "--worktree", f"path:{worktree}", "--title", title,
+               "--command", st.get("QA_AGENT_COMMAND", "claude"))
+    handle = find(res, "handle")
+    if not handle:
+        raise RuntimeError("터미널 handle 없음: " + json.dumps(res)[:200])
+    try:
+        orca("terminal", "wait", "--terminal", handle, "--for", "tui-idle", "--timeout-ms", "120000", timeout=150)
+    except Exception:
+        pass  # an agent that never reports idle still takes the text
+    orca("terminal", "send", "--terminal", handle, "--text",
+         f"Read the file {prompt_file} and follow its instructions exactly. {intro}", "--enter")
+    return handle
+
+
+def live_handles():
+    try:
+        return {t.get("handle") for t in (orca("terminal", "list").get("terminals") or []) if t.get("connected")}
+    except Exception:
+        return set()
+
+
+# ---------- commands ----------
+def cmd_init(st, a):
+    os.makedirs(st.dir, exist_ok=True)
+    for d in ("briefs", "claimed", "tickets", "ignored", "scratch", "log", "rounds") + SIGNALS + ("cleaned",):
+        os.makedirs(st.p(d), exist_ok=True)
+    tpl = os.path.join(REF, "config.env.example")
+    if not os.path.exists(st.p("config.env")):
+        shutil.copy(tpl, st.p("config.env"))
+        os.chmod(st.p("config.env"), 0o600)
+    if not os.path.exists(st.p("context.md")):
+        shutil.copy(os.path.join(REF, "context.md.example"), st.p("context.md"))
+    print(st.dir)
+
+
+def drive(st, key, status="", summary="", reopen=False):
+    t = st.ticket(key)
+    t.update(key=key, parent=st.parent, driver=True)
+    if summary:
+        t["summary"] = summary
+    rnd = len(st.claims(key)) + 1
+    if rnd > 1 and reopen:  # earlier round's signals go to rounds/<KEY>/<n>/ so the stage starts over
+        dest = st.p("rounds", key, str(rnd - 1))
+        for kind in SIGNALS:
+            for f in st.has(kind, key):
+                os.makedirs(os.path.join(dest, kind), exist_ok=True)
+                shutil.move(st.p(kind, f), os.path.join(dest, kind, f))
+    wt = (t.get("worktree") or {}).get("path")
+    if not (wt and os.path.isdir(wt)):
+        args = ["worktree", "create", "--repo", f'path:{st.get("QA_REPO")}', "--name", key, "--no-parent",
+                "--comment", f"QA {st.parent} · {t.get('summary', '')}"[:200]]
+        if st.get("QA_BASE_BRANCH"):
+            args += ["--base-branch", st.get("QA_BASE_BRANCH")]
+        if st.get("QA_WORKTREE_SETUP"):
+            args += ["--setup", st.get("QA_WORKTREE_SETUP")]
+        res = orca(*args, timeout=300)
+        wt = find(res, "path")
+        if not wt or not os.path.isdir(wt):
+            raise RuntimeError("워크트리 경로 없음: " + json.dumps(res)[:300])
+        t["worktree"] = {"path": wt, "id": find(res, "id"), "created_at": now()}
+        st.save_ticket(t)
+        log(st, f"WORKTREE {key} {wt}")
+    templates = (["brief-reopen.md"] if rnd > 1 else []) + ["brief-coordinator.md"]
+    brief = render(st, st.p("briefs", f"{key}.md"), templates, key, {"WORKTREE": wt, "ROUND": rnd})
+    render(st, st.p("worker-duties.md"), ["worker-duties.md"], "<티켓키>", {"WORKTREE": "<워크트리>", "ROUND": "<회차>"})
+    handle = start_agent(st, wt, f"{key} 코디네이터", brief, "그 파일의 지시를 그대로 수행하라.")
+    os.makedirs(st.p("claimed"), exist_ok=True)
+    with open(st.p("claimed", key), "a", encoding="utf-8") as f:
+        f.write(f"{now()}\t{int(time.time())}\t{handle}\t{t.get('summary', '')}\n")
+    t["coordinator"] = {"handle": handle, "at": now(), "round": rnd}
+    t["round"] = rnd
+    st.save_ticket(t)
+    log(st, f"DRIVE({status or 'manual'}) {key} round {rnd} ({handle}) — {t.get('summary', '')}")
+
+
+def cmd_run(st, a):
+    st.load(need=("JIRA_SITE", "JIRA_EMAIL", "QA_REPO", "QA_AUTO_HANDOFF", "QA_STATUS_NEW", "QA_STATUS_REOPEN"))
+    if st.get("QA_AUTO_HANDOFF") not in ("yes", "no"):
+        die("config.env QA_AUTO_HANDOFF 는 yes/no — 설정 때 사용자에게 한 번 묻고 적는다")
+    tickets, reopen = jira_open_children(st)
+    picks = []
+    for key, status, reopened, summary in tickets:
+        if os.path.exists(st.p("ignored", key)):
+            continue
+        cl = st.claims(key)
+        if cl:
+            if status != reopen or reopened <= int(cl[-1][1] or 0):
+                continue
+        picks.append((key, status, summary, bool(cl)))
+    room = max(0, int(st.get("QA_MAX_ACTIVE", "6")) - len(active(st)))
+    take = picks[:min(room, int(st.get("QA_MAX_NEW_PER_RUN", "10")))]
+    msg = f"조회 {len(tickets)}건 · 기동 후보 {len(picks)}건 · 동시 상한 여유 {room} → 이번 회차 {len(take)}건"
+    if a.pending:
+        print(msg, file=sys.stderr)
+        sys.exit(0 if take else 1)
+    if a.dry_run:
+        print(msg)
+        for k, s, summ, re_ in take:
+            print(f"기동 예정: {k}\t{s}{' (재기동)' if re_ else ''}\t{summ}")
+        return
+    with Lock(st):
+        log(st, msg)
+        for key, status, summary, re_ in take:
+            try:
+                drive(st, key, status, summary, reopen=re_)
+            except Exception as e:
+                log(st, f"ERROR {key}: {e}")
+
+
+def cmd_drive(st, a):
+    st.load(need=("QA_REPO", "QA_AUTO_HANDOFF"))
+    with Lock(st):
+        drive(st, a.key, reopen=bool(st.claims(a.key)))
+
+
+def cmd_worker(st, a):
+    st.load()
+    t = st.ticket(a.key)
+    wt = (t.get("worktree") or {}).get("path")
+    if not wt:
+        die(f"{a.key} 의 워크트리 기록이 없다 (qa-driver drive 로 기동한 티켓만)")
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", a.submodule.strip("/")) if a.submodule != "." else "root"
+    hand = st.p("handoffs", f"{a.key}-{name}.md")
+    if not os.path.isfile(hand):
+        die(f"{hand} 가 없다 — 인계 브리프를 먼저 쓴다")
+    render(st, st.p("worker-duties.md"), ["worker-duties.md"], "<티켓키>", {"WORKTREE": "<워크트리>", "ROUND": "<회차>"})
+    handle = start_agent(st, wt, f"{a.key} 워커 {name}", hand,
+                         f"그 다음 {st.p('worker-duties.md')} 의 의무를 따른다. 너의 저장소는 {a.submodule}, 신호 파일 이름은 {a.key}-{name}.md 다.")
+    t.setdefault("workers", {})[name] = {"handle": handle, "submodule": a.submodule, "at": now()}
+    st.save_ticket(t)
+    log(st, f"WORKER {a.key} {name} ({handle})")
+    print(handle)
+
+
+def cmd_status(st, a):
+    rows = status_rows(st)
+    if a.json:
+        print(json.dumps({"parent": st.parent, "state_dir": st.dir, "stages": STAGES, "tickets": rows}, ensure_ascii=False, indent=1))
+        return
+    for r in rows:
+        print(f'{r["key"]:<10} {r["stage"]:<12}{" 막힘" if r["blocked"] else ""}{" 제외" if r["ignored"] else ""} {r["round"]}회차  {r["summary"][:60]}')
+
+
+def cmd_approve(st, a):
+    st.load()
+    key = a.key
+    if f"{key}.md" not in st.has("ready", key) and not a.force:
+        die(f"{key}: ready/{key}.md 가 없다 — 코디네이터 검토가 끝난 티켓만 승인한다 (--force 로 무시)")
+    os.makedirs(st.p("approved"), exist_ok=True)
+    with open(st.p("approved", f"{key}.md"), "w", encoding="utf-8") as f:
+        f.write(f"# {key} 반출 승인\n\n- 시각: {now()}\n- 승인: {a.by}\n- 범위: ready/{key}.md 의 브랜치 push · PR 생성 (머지는 따로)\n")
+    t, cl = st.ticket(key), st.claims(key)
+    handle = (t.get("coordinator") or {}).get("handle") or (cl[-1][2] if cl and len(cl[-1]) > 2 else None)
+    text = (f"[qa-driver] 사용자가 {key} 반출(push·PR)을 승인했다 — {st.p('approved', key + '.md')}. "
+            f"브리프의 반출 단계를 진행하고, 끝나면 {st.p('delivered', key + '.md')} 에 PR 주소를 남겨라.")
+    if handle and handle in live_handles():
+        orca("terminal", "send", "--terminal", handle, "--text", text, "--enter")
+        print(f"전달: {handle}")
+    else:
+        wt = (t.get("worktree") or {}).get("path")
+        if not wt:
+            print("코디네이터 터미널이 닫혔고 워크트리 기록이 없다 — approved 파일만 남겼다")
+            return
+        brief = st.p("briefs", f"{key}.md")
+        h = start_agent(st, wt, f"{key} 코디네이터 (반출)", brief, text)
+        t["coordinator"] = {"handle": h, "at": now(), "round": t.get("round"), "for": "deliver"}
+        st.save_ticket(t)
+        print(f"새 코디네이터: {h}")
+    log(st, f"APPROVE {key} by {a.by}")
+
+
+def ticket_worktrees(st, key):
+    """The ticket's worktrees: the driver's record, or (an older watcher) Orca worktrees named after the key."""
+    wt = (st.ticket(key).get("worktree") or {}).get("path")
+    if wt:
+        return [wt]
+    try:
+        ws = orca("worktree", "list").get("worktrees") or []
+    except Exception:
+        return []
+    pat = re.compile(rf"(?<![A-Za-z0-9]){re.escape(key)}(?![0-9])")
+    return [w["path"] for w in ws if not w.get("isMainWorktree") and pat.search(os.path.basename(w.get("path") or ""))]
+
+
+def repo_problems(path):
+    """Uncommitted changes, or commits on the branch that no remote branch holds."""
+    out = []
+    if git(path, "status", "--porcelain"):
+        out.append(f"{path}: 커밋하지 않은 변경")
+    head = git(path, "rev-parse", "HEAD")
+    if head and not git(path, "branch", "-r", "--contains", head):
+        out.append(f"{path}: push 되지 않은 커밋 ({head[:9]})")
+    return out
+
+
+def cmd_cleanup(st, a):
+    st.load()
+    key, wts = a.key, ticket_worktrees(st, a.key)
+    if not wts:
+        die(f"{key}: 정리할 워크트리가 없다")
+    plan, problems = [], []
+    for wt in wts:
+        subs = []
+        if os.path.isfile(os.path.join(wt, ".gitmodules")):
+            for line in (git(wt, "config", "--file", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$") or "").splitlines():
+                sub = line.split()[1]
+                if os.path.exists(os.path.join(wt, sub, ".git")):
+                    subs.append(sub)
+                    problems += repo_problems(os.path.join(wt, sub))
+        if not subs:
+            problems += repo_problems(wt)
+        plan.append((wt, subs))
+    for wt, subs in plan:
+        print(f"정리: {wt}" + (f" (deinit: {', '.join(subs)})" if subs else ""))
+    if problems and not a.force:
+        die("멈춤 — " + " · ".join(problems) + " (--force 로 무시)", 3)
+    if a.dry_run:
+        return
+    for wt, subs in plan:
+        for sub in subs:
+            subprocess.run(["git", "-C", wt, "submodule", "deinit", "-f", "--", sub], capture_output=True, timeout=120)
+        orca("worktree", "rm", "--worktree", f"path:{wt}", *(["--force"] if a.force else []), timeout=300)
+        log(st, f"CLEANUP {key} {wt}")
+    os.makedirs(st.p("cleaned"), exist_ok=True)
+    with open(st.p("cleaned", key), "w", encoding="utf-8") as f:
+        f.write(f"{now()}\t{' '.join(wts)}\n")
+
+
+def cmd_ignore(st, a):
+    os.makedirs(st.p("ignored"), exist_ok=True)
+    p = st.p("ignored", a.key)
+    if a.undo:
+        if os.path.exists(p):
+            os.remove(p)
+    else:
+        open(p, "a").close()
+    log(st, f"{'UNIGNORE' if a.undo else 'IGNORE'} {a.key}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="qa-driver", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--home", help="state home (default $QA_DRIVER_HOME or ~/.qa-driver)")
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("init", "run", "drive", "worker", "status", "approve", "cleanup", "ignore"):
+        p = sp.add_parser(name)
+        p.add_argument("parent")
+        if name in ("drive", "worker", "approve", "cleanup", "ignore"):
+            p.add_argument("key")
+        if name == "worker":
+            p.add_argument("submodule")
+        if name == "run":
+            g = p.add_mutually_exclusive_group()
+            g.add_argument("--dry-run", action="store_true")
+            g.add_argument("--pending", action="store_true")
+        if name == "status":
+            p.add_argument("--json", action="store_true")
+        if name == "approve":
+            p.add_argument("--force", action="store_true")
+            p.add_argument("--by", default="사용자")
+        if name == "cleanup":
+            p.add_argument("--force", action="store_true")
+            p.add_argument("--dry-run", action="store_true")
+        if name == "ignore":
+            p.add_argument("--undo", action="store_true")
+    a = ap.parse_args()
+    if getattr(a, "key", None) and not re.fullmatch(r"[A-Z][A-Z0-9]+-\d+", a.key):
+        die(f"티켓 키 형식이 아니다: {a.key}")
+    st = State(a.parent.upper(), a.home)
+    try:
+        globals()["cmd_" + a.cmd](st, a)
+    except RuntimeError as e:
+        die(str(e))
+
+
+if __name__ == "__main__":
+    main()
