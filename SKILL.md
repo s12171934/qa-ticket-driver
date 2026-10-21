@@ -22,7 +22,7 @@ description: QA 부모 티켓(릴리스 QA 에픽 등) 하나를 주기적으로
 ## 파일
 | 위치 | 내용 |
 | --- | --- |
-| `bin/qa-driver` | CLI — `init` · `run` · `drive` · `worker` · `status` · `approve` · `cleanup` · `ignore` (`qa-driver --help`) |
+| `bin/qa-driver` | CLI — `init` · `run` · `drive` · `worker` · `status` · `approve` · `cleanup` · `ignore` · `restart` · `close` · `retire` · `adopt` (`qa-driver --help`) |
 | `references/brief-coordinator.md` · `brief-reopen.md` | 코디네이터 브리프 (재오픈 = 머리말 + 본 브리프) |
 | `references/worker-duties.md` | 워커 의무. 드라이버가 상태 디렉터리로 렌더한다 |
 | `references/config.env.example` · `context.md.example` | `init` 이 복사하는 견본 |
@@ -58,4 +58,12 @@ description: QA 부모 티켓(릴리스 QA 에픽 등) 하나를 주기적으로
 - **현황**: `qa-driver status <PARENT>` (또는 상태 계약을 읽는 대시보드).
 - **승인**: `ready/` 의 검증(특히 red 확인)을 읽고 `qa-driver approve <PARENT> <KEY>` — `approved/<KEY>.md` 를 남기고 코디네이터 터미널에 알린다(닫혔으면 그 워크트리에 반출용 코디네이터를 새로 띄운다).
 - **정리**: PR 이 머지된 뒤 `qa-driver cleanup <PARENT> <KEY>` — 커밋하지 않은 변경이나 push 되지 않은 커밋이 있으면 멈춘다. 서브모듈을 deinit 하고 워크트리를 지운다.
+- **코디네이터 관리**: 멈춘 코디네이터는 `qa-driver restart <PARENT> <KEY>`(기존 브리프로 같은 워크트리에 다시 띄움, 살아 있는 터미널이 있으면 거부), 끝난 티켓의 터미널은 `qa-driver close <PARENT> <KEY>...`.
 - **중지**: 스케줄을 끈다. 상태 디렉터리는 사후 확인을 위해 남긴다.
+- **QA 종료**: `qa-driver retire <PARENT> --dry-run` 으로 확인한 뒤 `retire` — 에픽을 부르는 자동화를 끄고, 옛 워처의 공용 조정 워크트리(`QA_COORD_WORKTREE`)가 있으면 그 터미널을 닫고 지운다. 검토 전 티켓이 남아 있거나 조정 워크트리에 커밋하지 않은 파일이 있으면 멈춘다.
+
+## 옛 워처에서 이관
+공용 조정 워크트리에 코디네이터를 띄우던 옛 워처(상태 디렉터리 `claimed/ handoffs/ ready/ blocked/`)도 같은 상태 계약으로 읽힌다.
+`qa-driver --home <옛 홈> adopt <PARENT> --check` 가 빠진 설정 키(와 `QA_REPO` 추정값)와 바꿀 자동화를 알려 주고,
+`adopt --set KEY=값 ... [--automation <id>]` 가 키를 `config.env` 에 더한 뒤 그 자동화의 precheck·프롬프트를 `qa-driver run` 으로 바꾼다.
+이미 claim 된 티켓은 그대로 두고, 이후 새로 열리거나 재오픈된 티켓부터 전용 워크트리로 간다. 옛 티켓의 코디네이터 재기동은 `QA_COORD_WORKTREE` 에서 한다.

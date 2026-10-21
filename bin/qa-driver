@@ -9,6 +9,13 @@
     qa-driver approve  <PARENT> <KEY> [--force]       record push/PR approval and tell the coordinator
     qa-driver cleanup  <PARENT> <KEY> [--force|--dry-run]  deinit submodules and remove the ticket worktree
     qa-driver ignore   <PARENT> <KEY> [--undo]        keep a ticket out of selection
+    qa-driver restart  <PARENT> <KEY> [--force]       start the ticket's coordinator again with its existing brief
+    qa-driver close    <PARENT> <KEY>...              close the tickets' live coordinator / worker terminals
+    qa-driver retire   <PARENT> [--dry-run|--force]   end of QA: disable its automations, close the shared
+                                                      coordination worktree's terminals and remove that worktree
+    qa-driver adopt    <PARENT> [--check] [--set K=V]... [--automation ID]
+                                                      take over an older watcher: fill missing config keys and point
+                                                      its Orca automation at `qa-driver run`
 
 State lives in $QA_DRIVER_HOME/<parent in lower case>/ (default ~/.qa-driver). --home <dir> points at another home,
 e.g. an older watcher's. Python 3 standard library only; needs the `orca` CLI and git.
@@ -232,8 +239,11 @@ def status_rows(st):
     return rows
 
 
+ACTIVE = ("selected", "worktree", "analysis", "implementing", "reviewing")  # a ticket that still has work before review ends
+
+
 def active(st):
-    return [r for r in status_rows(st) if r["stage"] not in ("delivered", "cleaned") and not r["blocked"] and not r["ignored"]]
+    return [r for r in status_rows(st) if r["stage"] in ACTIVE and not r["blocked"] and not r["ignored"]]
 
 
 # ---------- briefs ----------
@@ -491,6 +501,142 @@ def cmd_cleanup(st, a):
         f.write(f"{now()}\t{' '.join(wts)}\n")
 
 
+def ticket_handles(st, key):
+    """Every terminal this ticket ever had: each claim's coordinator, the recorded coordinator, its workers."""
+    t = st.ticket(key)
+    hs = [c[2] for c in st.claims(key) if len(c) > 2 and c[2]]
+    hs += [(t.get("coordinator") or {}).get("handle")] + [w.get("handle") for w in (t.get("workers") or {}).values()]
+    return [h for i, h in enumerate(hs) if h and h not in hs[:i]]
+
+
+def automations_of(st):
+    try:
+        res = orca("automations", "list")
+    except Exception:
+        return []
+    autos = res.get("automations", res) if isinstance(res, dict) else res
+    hit = re.compile(rf"(?<![A-Za-z0-9]){re.escape(st.parent)}(?![0-9])")
+    return [x for x in autos if hit.search(" ".join([x.get("name") or "", x.get("prompt") or "",
+                                                      (x.get("precheck") or {}).get("command") or ""]))]
+
+
+def cmd_restart(st, a):
+    st.load()
+    key, t = a.key, st.ticket(a.key)
+    brief = st.p("briefs", f"{key}.md")
+    if not os.path.isfile(brief):
+        die(f"{brief} 가 없다 — 기동된 적 없는 티켓은 drive 로 띄운다")
+    wt = (t.get("worktree") or {}).get("path") or st.get("QA_COORD_WORKTREE")
+    if not (wt and os.path.isdir(wt)):
+        die(f"{key}: 코디네이터를 띄울 워크트리가 없다 ({wt or '기록 없음'})")
+    live = [h for h in ticket_handles(st, key) if h in live_handles()]
+    if live and not a.force:
+        die(f"{key}: 살아 있는 터미널이 있다 ({', '.join(live)}) — 먼저 close 하거나 --force")
+    h = start_agent(st, wt, f"{key} 코디네이터 (재기동)", brief,
+                    "이전 코디네이터가 멈춰 다시 띄웠다. 기록 파일과 상태 디렉터리의 신호로 어디까지 했는지 먼저 확인하고 거기서 이어서 하라.")
+    t.update(key=key)
+    t["coordinator"] = {"handle": h, "at": now(), "round": len(st.claims(key)), "for": "restart"}
+    st.save_ticket(t)
+    log(st, f"RESTART {key} ({h})")
+    print(h)
+
+
+def cmd_close(st, a):
+    st.load()
+    live = live_handles()
+    for key in a.keys:
+        for h in ticket_handles(st, key):
+            if h in live:
+                try:
+                    orca("terminal", "close", "--terminal", h, timeout=60)
+                    log(st, f"CLOSE {key} {h}")
+                    print(f"닫음: {key} {h}")
+                except Exception as e:
+                    print(f"실패: {key} {h} — {e}", file=sys.stderr)
+
+
+def cmd_retire(st, a):
+    st.load()
+    autos = [x for x in automations_of(st) if x.get("enabled")]
+    open_ = [r["key"] for r in status_rows(st) if r["stage"] in ACTIVE and not r["ignored"]]
+    coord = st.get("QA_COORD_WORKTREE")
+    coord = coord if coord and os.path.isdir(coord) else None
+    terms = []
+    try:
+        terms = [x["handle"] for x in orca("terminal", "list").get("terminals") or []
+                 if x.get("connected") and coord and (x.get("worktreePath") or "").rstrip("/") == coord.rstrip("/")]
+    except Exception:
+        pass
+    problems = []
+    if coord:
+        problems += repo_problems_root(coord)
+    print(f"자동화 끄기: {', '.join(x.get('name') or x['id'] for x in autos) or '없음'}")
+    print(f"조정 워크트리: {coord or '없음'}" + (f" (열린 터미널 {len(terms)}개를 닫고 지움)" if coord else ""))
+    if open_:
+        print(f"아직 검토 전인 티켓: {', '.join(open_)}")
+    if (open_ or problems) and not a.force:
+        die("멈춤 — " + " · ".join(([f"검토 전 티켓 {len(open_)}개"] if open_ else []) + problems) + " (--force 로 무시)", 3)
+    if a.dry_run:
+        return
+    for x in autos:
+        orca("automations", "edit", x["id"], "--disabled", timeout=30)
+        log(st, f"RETIRE automation off {x['id']}")
+    for h in terms:
+        try:
+            orca("terminal", "close", "--terminal", h, timeout=60)
+        except Exception as e:
+            print(f"터미널 {h} 닫기 실패 — {e}", file=sys.stderr)
+    if coord:
+        for line in (git(coord, "config", "--file", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$") or "").splitlines():
+            sub = line.split()[-1]
+            if os.path.exists(os.path.join(coord, sub, ".git")):
+                subprocess.run(["git", "-C", coord, "submodule", "deinit", "-f", "--", sub], capture_output=True, timeout=120)
+        orca("worktree", "rm", "--worktree", f"path:{coord}", *(["--force"] if a.force else []), timeout=300)
+        log(st, f"RETIRE removed {coord}")
+    with open(st.p("retired"), "w", encoding="utf-8") as f:
+        f.write(now() + "\n")
+
+
+def repo_problems_root(path):
+    """A shared coordination worktree: its own uncommitted files only (submodules there are read-only checkouts)."""
+    return [f"{path}: 커밋하지 않은 변경"] if git(path, "status", "--porcelain", "--ignore-submodules=all") else []
+
+
+ADOPT_NEED = ("JIRA_SITE", "JIRA_EMAIL", "QA_REPO", "QA_AUTO_HANDOFF", "QA_STATUS_NEW", "QA_STATUS_REOPEN")
+
+
+def cmd_adopt(st, a):
+    st.load()
+    sets = dict(kv.split("=", 1) for kv in a.set if "=" in kv)
+    hints = {}
+    coord = st.get("QA_COORD_WORKTREE")
+    if coord and os.path.isdir(coord):  # the older watcher's worktree belongs to the repo the driver should use
+        common = git(coord, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        if common:
+            hints["QA_REPO"] = os.path.dirname(common) if os.path.basename(common) == ".git" else common
+    missing = [k for k in ADOPT_NEED if not (st.get(k) or sets.get(k))]
+    autos = automations_of(st)
+    if a.check:
+        print(json.dumps({"missing": missing, "hints": hints, "automations": [
+            {"id": x["id"], "name": x.get("name"), "enabled": x.get("enabled"), "adopted": "qa-driver" in (x.get("prompt") or "")}
+            for x in autos]}, ensure_ascii=False))
+        return
+    if missing:
+        die("config.env 에 없는 키: " + ", ".join(missing) + " (--set KEY=값)")
+    target = [x for x in autos if x["id"] == a.automation] if a.automation else autos
+    if len(target) != 1:
+        die(f"바꿀 자동화를 하나로 정하지 못했다 ({len(target)}개) — --automation <id>")
+    if sets:
+        with open(st.p("config.env"), "a", encoding="utf-8") as f:
+            f.write(f"\n# qa-ticket-driver 이관 ({now()})\n" + "".join(f'{k}={shlex.quote(v)}\n' for k, v in sets.items()))
+    drv = os.path.join(SKILL_DIR, "bin", "qa-driver")
+    base = f'{shlex.quote(drv)} --home {shlex.quote(st.home)} run {st.parent}'
+    orca("automations", "edit", target[0]["id"], "--precheck", f"{base} --pending",
+         "--prompt", f"{base} 를 한 번 실행하고 마지막 줄만 보고하라. 다른 일은 하지 않는다.", timeout=30)
+    log(st, f"ADOPT automation {target[0]['id']} → qa-driver" + (f" (설정 추가: {', '.join(sets)})" if sets else ""))
+    print(f"이관: {target[0].get('name') or target[0]['id']} 가 이제 qa-driver run 을 부른다")
+
+
 def cmd_ignore(st, a):
     os.makedirs(st.p("ignored"), exist_ok=True)
     p = st.p("ignored", a.key)
@@ -506,11 +652,22 @@ def main():
     ap = argparse.ArgumentParser(prog="qa-driver", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--home", help="state home (default $QA_DRIVER_HOME or ~/.qa-driver)")
     sp = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("init", "run", "drive", "worker", "status", "approve", "cleanup", "ignore"):
+    for name in ("init", "run", "drive", "worker", "status", "approve", "cleanup", "ignore", "restart", "close", "retire", "adopt"):
         p = sp.add_parser(name)
         p.add_argument("parent")
-        if name in ("drive", "worker", "approve", "cleanup", "ignore"):
+        if name in ("drive", "worker", "approve", "cleanup", "ignore", "restart"):
             p.add_argument("key")
+        if name == "close":
+            p.add_argument("keys", nargs="+")
+        if name == "restart":
+            p.add_argument("--force", action="store_true")
+        if name == "retire":
+            p.add_argument("--dry-run", action="store_true")
+            p.add_argument("--force", action="store_true")
+        if name == "adopt":
+            p.add_argument("--check", action="store_true")
+            p.add_argument("--set", action="append", default=[])
+            p.add_argument("--automation")
         if name == "worker":
             p.add_argument("submodule")
         if name == "run":
@@ -528,8 +685,9 @@ def main():
         if name == "ignore":
             p.add_argument("--undo", action="store_true")
     a = ap.parse_args()
-    if getattr(a, "key", None) and not re.fullmatch(r"[A-Z][A-Z0-9]+-\d+", a.key):
-        die(f"티켓 키 형식이 아니다: {a.key}")
+    for k in ([a.key] if getattr(a, "key", None) else []) + (getattr(a, "keys", None) or []):
+        if not re.fullmatch(r"[A-Z][A-Z0-9]+-\d+", k):
+            die(f"티켓 키 형식이 아니다: {k}")
     st = State(a.parent.upper(), a.home)
     try:
         globals()["cmd_" + a.cmd](st, a)

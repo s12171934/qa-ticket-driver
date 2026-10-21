@@ -28,6 +28,7 @@ source: ai
 | `cleaned/<KEY>` | `qa-driver cleanup` | 워크트리 정리 완료 |
 | `blocked/<KEY>[-<이름>].md` | 코디네이터·워커 | 막힘. 셋째 줄이 한 줄 요약 |
 | `ignored/<KEY>` | 사용자 | 선별에서 제외 |
+| `retired` | `qa-driver retire` | QA 종료 처리 시각 |
 | `rounds/<KEY>/<n>/<종류>/` | 드라이버 | 재오픈 때 옮긴 이전 회차 신호 |
 | `log/<YYYYMMDD>.log` | 드라이버 | 회차·기동·승인·정리 기록 |
 
@@ -50,5 +51,6 @@ source: ai
 | 1 | `selected` 선별됨 | 그 밖 |
 
 - 신호 파일 이름은 `<KEY>.md` 또는 `<KEY>-<이름>.md` 다. `<KEY>.round1.md` 처럼 점이 든 이름은 옛 워처의 회차 사본이라 세지 않는다.
-- 진행 중 티켓 수(동시 상한 `QA_MAX_ACTIVE` 에 쓰는 값) = `delivered`·`cleaned` 가 아니고, 막힘·제외도 아닌 티켓.
+- 진행 중 티켓 수(동시 상한 `QA_MAX_ACTIVE` 에 쓰는 값) = 단계가 `selected`~`reviewing`(검토가 끝나기 전)이고 막힘·제외가 아닌 티켓. 검토가 끝나 승인을 기다리는 티켓은 세지 않는다.
+- `retired` 파일이 있으면 그 QA 는 종료 처리됐다(`qa-driver retire`).
 - `qa-driver status <PARENT> --json` 이 같은 규칙으로 판정한 결과를 낸다.
