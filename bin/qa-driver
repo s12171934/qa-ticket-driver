@@ -448,9 +448,10 @@ def ticket_worktrees(st, key):
 
 
 def repo_problems(path):
-    """Uncommitted changes, or commits on the branch that no remote branch holds."""
+    """Uncommitted changes, or commits on the branch that no remote branch holds. Submodule pointer moves in a
+    superproject are not changes of its own (each populated submodule is checked by itself)."""
     out = []
-    if git(path, "status", "--porcelain"):
+    if git(path, "status", "--porcelain", "--ignore-submodules=all"):
         out.append(f"{path}: 커밋하지 않은 변경")
     head = git(path, "rev-parse", "HEAD")
     if head and not git(path, "branch", "-r", "--contains", head):
@@ -472,8 +473,7 @@ def cmd_cleanup(st, a):
                 if os.path.exists(os.path.join(wt, sub, ".git")):
                     subs.append(sub)
                     problems += repo_problems(os.path.join(wt, sub))
-        if not subs:
-            problems += repo_problems(wt)
+        problems += repo_problems(wt)
         plan.append((wt, subs))
     for wt, subs in plan:
         print(f"정리: {wt}" + (f" (deinit: {', '.join(subs)})" if subs else ""))
