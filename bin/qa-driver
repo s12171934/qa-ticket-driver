@@ -512,16 +512,41 @@ def ticket_worktrees(st, key):
     return [w["path"] for w in ws if not w.get("isMainWorktree") and pat.search(os.path.basename(w.get("path") or ""))]
 
 
+def merged_into_base(path, head):
+    """HEAD is already in a base branch the remote holds (origin/HEAD, main, master, develop, support/*) — a branch
+    with nothing of its own, or one merged with a merge commit / fast-forward."""
+    bases = [r for r in (git(path, "for-each-ref", "--format=%(refname:short)", "refs/remotes/origin") or "").splitlines()
+             if r in ("origin", "origin/main", "origin/master", "origin/develop") or r.startswith("origin/support/")]
+    return any(subprocess.run(["git", "-C", path, "merge-base", "--is-ancestor", head, b], capture_output=True).returncode == 0
+               for b in bases)
+
+
+def merged_pr_heads(path):
+    """Heads of the merged PRs opened from this checkout's branch (squash merges leave no ancestry). None when gh fails."""
+    branch = git(path, "rev-parse", "--abbrev-ref", "HEAD")
+    if not branch or branch == "HEAD":
+        return set()
+    r = subprocess.run(["gh", "pr", "list", "--head", branch, "--state", "merged", "--json", "headRefOid"],
+                       cwd=path, capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        return None
+    return {d["headRefOid"] for d in json.loads(r.stdout or "[]")}
+
+
 def repo_problems(path, merged_heads=()):
-    """Uncommitted changes, or commits on the branch that no remote branch holds. Submodule pointer moves in a
-    superproject are not changes of its own (each populated submodule is checked by itself). A HEAD that is the head
-    of a merged PR counts as pushed even when a squash merge and a deleted branch leave no remote branch holding it."""
+    """Uncommitted changes, or a HEAD that is not merged — neither in a remote base branch nor the head of a merged
+    PR (delivered/ record or gh). A pushed but unmerged branch counts: its open PR still needs the worktree. Submodule
+    pointer moves in a superproject are not changes of its own (each populated submodule is checked by itself)."""
     out = []
     if git(path, "status", "--porcelain", "--ignore-submodules=all"):
         out.append(f"{path}: 커밋하지 않은 변경")
     head = git(path, "rev-parse", "HEAD")
-    if head and head not in merged_heads and not git(path, "branch", "-r", "--contains", head):
-        out.append(f"{path}: push 되지 않은 커밋 ({head[:9]})")
+    if head and head not in merged_heads and not merged_into_base(path, head):
+        pr_heads = merged_pr_heads(path)
+        if pr_heads is None:
+            out.append(f"{path}: 머지 여부 확인 실패 (gh)")
+        elif head not in pr_heads:
+            out.append(f"{path}: 머지되지 않은 커밋 ({head[:9]})")
     return out
 
 
