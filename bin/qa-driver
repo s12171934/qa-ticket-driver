@@ -180,31 +180,49 @@ def jira_token(st):
     return t
 
 
-def jira_open_children(st):
-    """[(key, status, last reopen epoch, summary)] for the parent's tickets in the new / reopen states."""
-    new, reopen = st.get("QA_STATUS_NEW", "To Do"), st.get("QA_STATUS_REOPEN", "Reopened")
-    jql = st.get("QA_JQL") or f'parent = {st.parent} AND status IN ("{new}", "{reopen}") ORDER BY created ASC'
+def jira_search(st, jql, fields, expand=None):
+    """Every issue the JQL matches, across pages."""
     auth = base64.b64encode(f'{st.get("JIRA_EMAIL")}:{jira_token(st)}'.encode()).decode()
     site = st.get("JIRA_SITE").removeprefix("https://").rstrip("/")
     out, nxt = [], None
     while True:
-        q = {"jql": jql, "fields": "summary,status", "expand": "changelog", "maxResults": "100"}
+        q = {"jql": jql, "fields": fields, "maxResults": "100"}
+        if expand:
+            q["expand"] = expand
         if nxt:
             q["nextPageToken"] = nxt
         req = Request(f"https://{site}/rest/api/3/search/jql?{urlencode(q)}",
                       headers={"Authorization": "Basic " + auth, "Accept": "application/json"})
         with urlopen(req, timeout=30) as r:
             d = json.load(r)
-        for i in d.get("issues") or []:
-            last = 0
-            for h in (i.get("changelog") or {}).get("histories") or []:
-                if any(it.get("field") == "status" and it.get("toString") == reopen for it in h.get("items") or []):
-                    ts = datetime.datetime.strptime(h["created"], "%Y-%m-%dT%H:%M:%S.%f%z").timestamp()
-                    last = max(last, int(ts))
-            out.append((i["key"], i["fields"]["status"]["name"], last, (i["fields"].get("summary") or "").replace("\t", " ")))
+        out += d.get("issues") or []
         nxt = d.get("nextPageToken")
         if not nxt or d.get("isLast", True):
-            return out, reopen
+            return out
+
+
+def jira_open_children(st):
+    """[(key, status, last reopen epoch, summary)] for the parent's tickets in the new / reopen states."""
+    new, reopen = st.get("QA_STATUS_NEW", "To Do"), st.get("QA_STATUS_REOPEN", "Reopened")
+    jql = st.get("QA_JQL") or f'parent = {st.parent} AND status IN ("{new}", "{reopen}") ORDER BY created ASC'
+    out = []
+    for i in jira_search(st, jql, "summary,status", expand="changelog"):
+        last = 0
+        for h in (i.get("changelog") or {}).get("histories") or []:
+            if any(it.get("field") == "status" and it.get("toString") == reopen for it in h.get("items") or []):
+                ts = datetime.datetime.strptime(h["created"], "%Y-%m-%dT%H:%M:%S.%f%z").timestamp()
+                last = max(last, int(ts))
+        out.append((i["key"], i["fields"]["status"]["name"], last, (i["fields"].get("summary") or "").replace("\t", " ")))
+    return out, reopen
+
+
+def jira_done_keys(st):
+    """Keys of the parent's tickets in a QA_STATUS_DONE state (comma-separated names). Unset = none."""
+    names = [n.strip() for n in st.get("QA_STATUS_DONE", "").split(",") if n.strip()]
+    if not names:
+        return set()
+    jql = f'parent = {st.parent} AND status IN ({", ".join(chr(34) + n + chr(34) for n in names)})'
+    return {i["key"] for i in jira_search(st, jql, "status")}
 
 
 # ---------- stages (exports/state-contract.md) ----------
@@ -356,6 +374,7 @@ def cmd_run(st, a):
     if st.get("QA_AUTO_HANDOFF") not in ("yes", "no"):
         die("config.env QA_AUTO_HANDOFF 는 yes/no — 설정 때 사용자에게 한 번 묻고 적는다")
     tickets, reopen = jira_open_children(st)
+    done_keys = jira_done_keys(st)
     picks = []
     for key, status, reopened, summary in tickets:
         if os.path.exists(st.p("ignored", key)):
@@ -369,9 +388,9 @@ def cmd_run(st, a):
     take = picks[:min(room, int(st.get("QA_MAX_NEW_PER_RUN", "10")))]
     msg = f"조회 {len(tickets)}건 · 기동 후보 {len(picks)}건 · 동시 상한 여유 {room} → 이번 회차 {len(take)}건"
     if a.pending or a.dry_run:
-        cleans = merged_cleanups(st)
+        cleans = finished_cleanups(st, done_keys)
         ready = [k for k, _, problems in cleans if not problems]
-        msg += f" · 머지 후 정리 {len(ready)}건"
+        msg += f" · 완료 정리 {len(ready)}건"
     if a.pending:
         print(msg, file=sys.stderr)
         sys.exit(0 if take or ready else 1)
@@ -389,7 +408,7 @@ def cmd_run(st, a):
                 drive(st, key, status, summary, reopen=re_)
             except Exception as e:
                 log(st, f"ERROR {key}: {e}")
-        sweep_merged(st)
+        sweep_finished(st, done_keys)
 
 
 def cmd_drive(st, a):
@@ -521,11 +540,12 @@ def cleanup_plan(wts, merged_heads=()):
     return plan, problems
 
 
-def cleanup_execute(st, key, plan, force=False):
+def cleanup_execute(st, key, plan):
     for wt, subs in plan:
         for sub in subs:
             subprocess.run(["git", "-C", wt, "submodule", "deinit", "-f", "--", sub], capture_output=True, timeout=120)
-        orca("worktree", "rm", "--worktree", f"path:{wt}", *(["--force"] if force else []), timeout=300)
+        # Without --force orca reports removed:true yet leaves the worktree in place; loss checks run before this.
+        orca("worktree", "rm", "--worktree", f"path:{wt}", "--force", timeout=300)
         log(st, f"CLEANUP {key} {wt}")
     os.makedirs(st.p("cleaned"), exist_ok=True)
     with open(st.p("cleaned", key), "w", encoding="utf-8") as f:
@@ -544,7 +564,7 @@ def cmd_cleanup(st, a):
         die("멈춤 — " + " · ".join(problems) + " (--force 로 무시)", 3)
     if a.dry_run:
         return
-    cleanup_execute(st, key, plan, a.force)
+    cleanup_execute(st, key, plan)
 
 
 PR_URL = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/pull/\d+")
@@ -574,13 +594,20 @@ def merged_heads(st, key):
         return set()
 
 
-def merged_cleanups(st):
-    """Delivered tickets whose driver-made worktree still exists and whose PRs are all merged:
+def finished_cleanups(st, done_keys):
+    """Tickets whose driver-made worktree still exists and that are finished — every PR in delivered/<KEY>.md
+    merged, or the Jira status is one of QA_STATUS_DONE (also covers tickets closed without a PR):
     [(key, plan, problems)]. Only worktrees the driver recorded — never a name-matched guess."""
     out = []
     for r in status_rows(st):
         wt = (st.ticket(r["key"]).get("worktree") or {}).get("path")
-        if r["stage"] != "delivered" or not (wt and os.path.isdir(wt)):
+        if r["stage"] == "cleaned" or not (wt and os.path.isdir(wt)):
+            continue
+        if r["key"] in done_keys:
+            plan, problems = cleanup_plan([wt], merged_heads(st, r["key"]))
+            out.append((r["key"], plan, problems))
+            continue
+        if r["stage"] != "delivered":
             continue
         try:
             prs = delivered_prs(st, r["key"])
@@ -593,10 +620,10 @@ def merged_cleanups(st):
     return out
 
 
-def sweep_merged(st):
-    """Close the live terminals of each merged ticket and remove its worktree. A ticket with something unpushed
+def sweep_finished(st, done_keys):
+    """Close the live terminals of each finished ticket and remove its worktree. A ticket with something unpushed
     stays and is logged once per distinct reason."""
-    for key, plan, problems in merged_cleanups(st):
+    for key, plan, problems in finished_cleanups(st, done_keys):
         t = st.ticket(key)
         if problems:
             reason = " · ".join(problems)
@@ -706,7 +733,7 @@ def cmd_retire(st, a):
             sub = line.split()[-1]
             if os.path.exists(os.path.join(coord, sub, ".git")):
                 subprocess.run(["git", "-C", coord, "submodule", "deinit", "-f", "--", sub], capture_output=True, timeout=120)
-        orca("worktree", "rm", "--worktree", f"path:{coord}", *(["--force"] if a.force else []), timeout=300)
+        orca("worktree", "rm", "--worktree", f"path:{coord}", "--force", timeout=300)
         log(st, f"RETIRE removed {coord}")
     with open(st.p("retired"), "w", encoding="utf-8") as f:
         f.write(now() + "\n")
