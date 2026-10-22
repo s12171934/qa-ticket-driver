@@ -58,7 +58,7 @@ description: QA 부모 티켓(릴리스 QA 에픽 등) 하나를 주기적으로
 - **현황**: `qa-driver status <PARENT>` (또는 상태 계약을 읽는 대시보드).
 - **승인**: `ready/` 의 검증(특히 red 확인)을 읽고 `qa-driver approve <PARENT> <KEY>` — `approved/<KEY>.md` 를 남기고 코디네이터 터미널에 알린다(닫혔으면 그 워크트리에 반출용 코디네이터를 새로 띄운다).
 - **머지 지시**: 반출된(`delivered/`) 티켓의 PR 을 확인하고 `qa-driver merge <PARENT> <KEY>` — `merge/<KEY>.md` 를 남기고 코디네이터 터미널에 머지를 지시한다(닫혔으면 새로 띄운다). 코디네이터는 의존 저장소부터 머지하고, 못 하면 `blocked/` 에 사유를 남긴다.
-- **정리**: `run` 회차가 `delivered/<KEY>.md` 의 PR 이 모두 머지됐거나 Jira 상태가 `QA_STATUS_DONE` 중 하나인 티켓(코드 수정 없이 끝난 티켓 포함)을 찾아 그 터미널을 닫고 워크트리를 지운다(`gh` 필요, 드라이버가 만든 워크트리만). 커밋하지 않은 변경이나 push 되지 않은 커밋이 있으면 남기고 로그에 `CLEANUP-SKIP` 을 한 번 적는다. 손으로는 `qa-driver cleanup <PARENT> <KEY>` — 같은 검사 뒤 서브모듈을 deinit 하고 워크트리를 지운다.
+- **정리**: `run` 회차가 `delivered/<KEY>.md` 의 PR 이 모두 머지됐거나, PR 없이 Jira 상태가 `QA_STATUS_DONE` 중 하나인 티켓(코드 수정 없이 끝난 티켓)을 — 열린 PR 이 있으면 Jira 상태와 무관하게 남긴다 — 찾아 그 터미널을 닫고 워크트리를 지운다(`gh` 필요, 드라이버가 만든 워크트리만). 커밋하지 않은 변경이나 push 되지 않은 커밋이 있으면 남기고 로그에 `CLEANUP-SKIP` 을 한 번 적는다. 손으로는 `qa-driver cleanup <PARENT> <KEY>` — 같은 검사 뒤 서브모듈을 deinit 하고 워크트리를 지운다.
 - **코디네이터 관리**: 멈춘 코디네이터는 `qa-driver restart <PARENT> <KEY>`(기존 브리프로 같은 워크트리에 다시 띄움, 살아 있는 터미널이 있으면 거부), 끝난 티켓의 터미널은 `qa-driver close <PARENT> <KEY>...`.
 - **중지**: 스케줄을 끈다. 상태 디렉터리는 사후 확인을 위해 남긴다.
 - **QA 종료**: `qa-driver retire <PARENT> --dry-run` 으로 확인한 뒤 `retire` — 에픽을 부르는 자동화를 끄고, 옛 워처의 공용 조정 워크트리(`QA_COORD_WORKTREE`)가 있으면 그 터미널을 닫고 지운다. 검토 전 티켓이 남아 있거나 조정 워크트리에 커밋하지 않은 파일이 있으면 멈춘다.

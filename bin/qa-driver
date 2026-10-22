@@ -596,25 +596,22 @@ def merged_heads(st, key):
 
 def finished_cleanups(st, done_keys):
     """Tickets whose driver-made worktree still exists and that are finished — every PR in delivered/<KEY>.md
-    merged, or the Jira status is one of QA_STATUS_DONE (also covers tickets closed without a PR):
-    [(key, plan, problems)]. Only worktrees the driver recorded — never a name-matched guess."""
+    merged, or no PR at all and the Jira status is one of QA_STATUS_DONE (a ticket closed without a fix):
+    [(key, plan, problems)]. An open PR keeps the worktree whatever Jira says — the merge step still needs it.
+    Only worktrees the driver recorded — never a name-matched guess."""
     out = []
     for r in status_rows(st):
         wt = (st.ticket(r["key"]).get("worktree") or {}).get("path")
         if r["stage"] == "cleaned" or not (wt and os.path.isdir(wt)):
             continue
-        if r["key"] in done_keys:
-            plan, problems = cleanup_plan([wt], merged_heads(st, r["key"]))
-            out.append((r["key"], plan, problems))
-            continue
-        if r["stage"] != "delivered":
+        if r["stage"] != "delivered" and r["key"] not in done_keys:
             continue
         try:
             prs = delivered_prs(st, r["key"])
         except (RuntimeError, OSError) as e:
             print(f"qa-driver: {r['key']} PR 조회 실패, 이번 회차 정리 건너뜀 — {e}", file=sys.stderr)
             continue
-        if prs and all(state == "MERGED" for state, _ in prs.values()):
+        if prs and all(state == "MERGED" for state, _ in prs.values()) or not prs and r["key"] in done_keys:
             plan, problems = cleanup_plan([wt], {head for _, head in prs.values()})
             out.append((r["key"], plan, problems))
     return out
