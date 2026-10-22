@@ -322,8 +322,9 @@ def drive(st, key, status="", summary="", reopen=False):
                 shutil.move(st.p(kind, f), os.path.join(dest, kind, f))
     wt = (t.get("worktree") or {}).get("path")
     if not (wt and os.path.isdir(wt)):
-        args = ["worktree", "create", "--repo", f'path:{st.get("QA_REPO")}', "--name", key, "--no-parent",
+        args = ["worktree", "create", "--repo", f'path:{st.get("QA_REPO")}', "--name", key,
                 "--comment", f"QA {st.parent} · {t.get('summary', '')}"[:200]]
+        args += ["--parent-worktree", f'path:{st.get("QA_PARENT_WORKTREE")}'] if st.get("QA_PARENT_WORKTREE") else ["--no-parent"]
         if st.get("QA_BASE_BRANCH"):
             args += ["--base-branch", st.get("QA_BASE_BRANCH")]
         if st.get("QA_WORKTREE_SETUP"):
