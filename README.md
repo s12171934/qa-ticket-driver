@@ -1,7 +1,7 @@
 ---
 title: qa-ticket-driver
 created: 2026-10-21
-updated: 2026-10-21
+updated: 2026-10-22
 tags: [domain/인공지능, area/ai에이전트]
 source: ai
 ---
@@ -16,14 +16,9 @@ source: ai
 - 코디네이터·워커·사용자 사이의 진행은 상태 디렉터리의 신호 파일로 주고받는다. 단계 판정 규칙은 공개 계약으로 둔다.
 - 반출 승인·워크트리 정리·제외를 CLI 로 제공한다. 대시보드가 같은 CLI 와 계약으로 제어·표시할 수 있다.
 
-## 설치
+## 전제
 
-```bash
-git clone https://github.com/s12171934/qa-ticket-driver.git ~/.claude/skills/qa-ticket-driver
-# 다른 도구는 그 도구의 스킬 경로에 링크한다. 예: ln -s ~/.claude/skills/qa-ticket-driver ~/.codex/skills/qa-ticket-driver
-```
-
-- 전제: macOS, `orca` CLI, `git`, Python 3, Jira Cloud API 토큰.
+- macOS, `orca` CLI, `git`, Python 3, Jira Cloud API 토큰.
 
 ## 구성과 공개 면
 
