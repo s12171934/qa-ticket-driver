@@ -25,6 +25,7 @@ source: ai
 | `ready/<KEY>.md` | 코디네이터 | 검토 완료 — 반출 승인 대기 |
 | `approved/<KEY>.md` | 사용자(대시보드·`qa-driver approve`) | 반출(push·PR) 승인 |
 | `delivered/<KEY>.md` | 코디네이터 | 저장소별 PR 주소 |
+| `merge/<KEY>.md` | 사용자(대시보드·`qa-driver merge`) | PR 머지 지시. 단계가 아니라 `delivered` 에 덧붙는 표시 |
 | `cleaned/<KEY>` | 드라이버(`run` 회차 · `qa-driver cleanup`) | 워크트리 정리 완료. `run` 은 `delivered/<KEY>.md` 의 PR 이 모두 머지되면 정리한다 |
 | `blocked/<KEY>[-<이름>].md` | 코디네이터·워커 | 막힘. 셋째 줄이 한 줄 요약 |
 | `ignored/<KEY>` | 사용자 | 선별에서 제외 |
@@ -36,7 +37,7 @@ source: ai
 
 ## 단계
 
-위에서부터 처음 맞는 것이 그 티켓의 단계다. `blocked` 와 `ignored` 는 단계가 아니라 덧붙는 표시다.
+위에서부터 처음 맞는 것이 그 티켓의 단계다. `blocked`·`ignored`·`merge` 는 단계가 아니라 덧붙는 표시다.
 
 | 순서 | 단계 | 조건 |
 | --- | --- | --- |

@@ -8,6 +8,7 @@
     qa-driver worker   <PARENT> <KEY> <SUBMODULE>     coordinator only: worker terminal in the same worktree
     qa-driver status   <PARENT> [--json]              stage of every claimed ticket (exports/state-contract.md)
     qa-driver approve  <PARENT> <KEY> [--force]       record push/PR approval and tell the coordinator
+    qa-driver merge    <PARENT> <KEY>                 delivered ticket: record the merge order and tell the coordinator
     qa-driver cleanup  <PARENT> <KEY> [--force|--dry-run]  deinit submodules and remove the ticket worktree
     qa-driver ignore   <PARENT> <KEY> [--undo]        keep a ticket out of selection
     qa-driver restart  <PARENT> <KEY> [--force]       start the ticket's coordinator again with its existing brief
@@ -37,7 +38,7 @@ import base64
 
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 REF = os.path.join(SKILL_DIR, "references")
-SIGNALS = ("handoffs", "done", "ready", "blocked", "approved", "delivered", "cleaned")  # moved to rounds/ on a reopen
+SIGNALS = ("handoffs", "done", "ready", "blocked", "approved", "delivered", "merge", "cleaned")  # moved to rounds/ on a reopen
 
 
 def die(msg, code=1):
@@ -433,24 +434,49 @@ def cmd_approve(st, a):
     os.makedirs(st.p("approved"), exist_ok=True)
     with open(st.p("approved", f"{key}.md"), "w", encoding="utf-8") as f:
         f.write(f"# {key} 반출 승인\n\n- 시각: {now()}\n- 승인: {a.by}\n- 범위: ready/{key}.md 의 브랜치 push · PR 생성 (머지는 따로)\n")
-    t, cl = st.ticket(key), st.claims(key)
-    handle = (t.get("coordinator") or {}).get("handle") or (cl[-1][2] if cl and len(cl[-1]) > 2 else None)
     text = (f"[qa-driver] 사용자가 {key} 반출(push·PR)을 승인했다 — {st.p('approved', key + '.md')}. "
             f"브리프의 반출 단계를 진행하고, 끝나면 {st.p('delivered', key + '.md')} 에 PR 주소를 남겨라.")
+    tell_coordinator(st, key, text, "반출", "deliver", "approved")
+    log(st, f"APPROVE {key} by {a.by}")
+
+
+def tell_coordinator(st, key, text, title, purpose, signal):
+    """Send text to the ticket's live coordinator, or start one with its brief in the ticket worktree."""
+    t, cl = st.ticket(key), st.claims(key)
+    handle = (t.get("coordinator") or {}).get("handle") or (cl[-1][2] if cl and len(cl[-1]) > 2 else None)
     if handle and handle in live_handles():
         orca("terminal", "send", "--terminal", handle, "--text", text, "--enter")
         print(f"전달: {handle}")
-    else:
-        wt = (t.get("worktree") or {}).get("path")
-        if not wt:
-            print("코디네이터 터미널이 닫혔고 워크트리 기록이 없다 — approved 파일만 남겼다")
-            return
-        brief = st.p("briefs", f"{key}.md")
-        h = start_agent(st, wt, f"{key} 코디네이터 (반출)", brief, text)
-        t["coordinator"] = {"handle": h, "at": now(), "round": t.get("round"), "for": "deliver"}
-        st.save_ticket(t)
-        print(f"새 코디네이터: {h}")
-    log(st, f"APPROVE {key} by {a.by}")
+        return
+    wt = (t.get("worktree") or {}).get("path")
+    if not wt:
+        print(f"코디네이터 터미널이 닫혔고 워크트리 기록이 없다 — {signal} 파일만 남겼다")
+        return
+    h = start_agent(st, wt, f"{key} 코디네이터 ({title})", st.p("briefs", f"{key}.md"), text)
+    t["coordinator"] = {"handle": h, "at": now(), "round": t.get("round"), "for": purpose}
+    st.save_ticket(t)
+    print(f"새 코디네이터: {h}")
+
+
+def cmd_merge(st, a):
+    st.load()
+    key = a.key
+    if f"{key}.md" not in st.has("delivered", key):
+        die(f"{key}: delivered/{key}.md 가 없다 — PR 을 올린(반출된) 티켓만 머지를 지시한다")
+    prs = PR_URL.findall(open(st.p("delivered", f"{key}.md"), encoding="utf-8").read())
+    if not prs:
+        die(f"{key}: delivered/{key}.md 에 PR 주소가 없다")
+    os.makedirs(st.p("merge"), exist_ok=True)
+    with open(st.p("merge", f"{key}.md"), "w", encoding="utf-8") as f:
+        f.write(f"# {key} 머지 지시\n\n- 시각: {now()}\n- 지시: {a.by}\n- 대상: " + " ".join(prs) + "\n")
+    # Self-contained: a brief rendered before the merge stage existed does not describe it.
+    text = (f"[qa-driver] 사용자가 {key} PR 머지를 지시했다 — {st.p('merge', key + '.md')}. 대상: {' '.join(prs)}. "
+            "의존 저장소의 PR 부터 머지하고, 소비처의 핀(서브모듈 포인터 등)은 머지된 해시로 갱신해 push 한 뒤 머지하라 "
+            "(squash 는 해시가 바뀐다). 체크 실패·충돌·리뷰 요구로 머지할 수 없으면 머지하지 말고 "
+            f"{st.p('blocked', key + '.md')} 에 사유를 남겨라. Jira 전이는 티켓 규칙 스킬대로. "
+            "워크트리 정리는 하지 않는다(PR 이 모두 머지되면 드라이버 회차가 터미널을 닫고 지운다).")
+    tell_coordinator(st, key, text, "머지", "merge", "merge")
+    log(st, f"MERGE-ORDER {key} by {a.by}")
 
 
 def ticket_worktrees(st, key):
@@ -741,10 +767,10 @@ def main():
     ap = argparse.ArgumentParser(prog="qa-driver", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--home", help="state home (default $QA_DRIVER_HOME or ~/.qa-driver)")
     sp = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("init", "run", "drive", "worker", "status", "approve", "cleanup", "ignore", "restart", "close", "retire", "adopt"):
+    for name in ("init", "run", "drive", "worker", "status", "approve", "merge", "cleanup", "ignore", "restart", "close", "retire", "adopt"):
         p = sp.add_parser(name)
         p.add_argument("parent")
-        if name in ("drive", "worker", "approve", "cleanup", "ignore", "restart"):
+        if name in ("drive", "worker", "approve", "merge", "cleanup", "ignore", "restart"):
             p.add_argument("key")
         if name == "close":
             p.add_argument("keys", nargs="+")
@@ -767,6 +793,7 @@ def main():
             p.add_argument("--json", action="store_true")
         if name == "approve":
             p.add_argument("--force", action="store_true")
+        if name in ("approve", "merge"):
             p.add_argument("--by", default="사용자")
         if name == "cleanup":
             p.add_argument("--force", action="store_true")

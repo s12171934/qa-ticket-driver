@@ -10,7 +10,7 @@ description: QA 부모 티켓(릴리스 QA 에픽 등) 하나를 주기적으로
 
 ```
 선별(run) ─► 워크트리(drive) ─► 코디네이터: 분석·기록 ─► 워커(같은 워크트리, 서브모듈당 1) ─► 코디네이터 검토
-   ─► ready ─► 사용자 승인(approve) ─► 코디네이터 반출(push·PR) ─► delivered ─► 정리(cleanup)
+   ─► ready ─► 사용자 승인(approve) ─► 코디네이터 반출(push·PR) ─► delivered ─► 사용자 머지 지시(merge) ─► 코디네이터 머지 ─► 정리(cleanup)
 ```
 
 **소유하는 것과 넘기는 것.** 이 스킬은 오케스트레이션만 소유한다 — 선별, claim, 워크트리·터미널 기동, 브리프, 상태 디렉터리, 코디네이터·워커 사이 신호. 티켓 규칙(Jira 분석·방향 확인·상태 전이·코멘트, 버그 수정 절차)과 저장소 규칙(베이스·커밋 형식)은 소유하지 않는다 — `config.env` 의 `QA_TICKET_SKILLS` 와 `QA_HARNESS_DOCS` 가 가리키는 쪽이 정본이고, 브리프는 그것을 가리키기만 한다.
@@ -22,7 +22,7 @@ description: QA 부모 티켓(릴리스 QA 에픽 등) 하나를 주기적으로
 ## 파일
 | 위치 | 내용 |
 | --- | --- |
-| `bin/qa-driver` | CLI — `init` · `run` · `drive` · `worker` · `status` · `approve` · `cleanup` · `ignore` · `restart` · `close` · `retire` · `adopt` (`qa-driver --help`) |
+| `bin/qa-driver` | CLI — `init` · `run` · `drive` · `worker` · `status` · `approve` · `merge` · `cleanup` · `ignore` · `restart` · `close` · `retire` · `adopt` (`qa-driver --help`) |
 | `references/brief-coordinator.md` · `brief-reopen.md` | 코디네이터 브리프 (재오픈 = 머리말 + 본 브리프) |
 | `references/worker-duties.md` | 워커 의무. 드라이버가 상태 디렉터리로 렌더한다 |
 | `references/config.env.example` · `context.md.example` | `init` 이 복사하는 견본 |
@@ -57,6 +57,7 @@ description: QA 부모 티켓(릴리스 QA 에픽 등) 하나를 주기적으로
 ## 사람이 하는 일
 - **현황**: `qa-driver status <PARENT>` (또는 상태 계약을 읽는 대시보드).
 - **승인**: `ready/` 의 검증(특히 red 확인)을 읽고 `qa-driver approve <PARENT> <KEY>` — `approved/<KEY>.md` 를 남기고 코디네이터 터미널에 알린다(닫혔으면 그 워크트리에 반출용 코디네이터를 새로 띄운다).
+- **머지 지시**: 반출된(`delivered/`) 티켓의 PR 을 확인하고 `qa-driver merge <PARENT> <KEY>` — `merge/<KEY>.md` 를 남기고 코디네이터 터미널에 머지를 지시한다(닫혔으면 새로 띄운다). 코디네이터는 의존 저장소부터 머지하고, 못 하면 `blocked/` 에 사유를 남긴다.
 - **정리**: `run` 회차가 `delivered/<KEY>.md` 의 PR 이 모두 머지된 티켓을 찾아 그 터미널을 닫고 워크트리를 지운다(`gh` 필요, 드라이버가 만든 워크트리만). 커밋하지 않은 변경이나 push 되지 않은 커밋이 있으면 남기고 로그에 `CLEANUP-SKIP` 을 한 번 적는다. 손으로는 `qa-driver cleanup <PARENT> <KEY>` — 같은 검사 뒤 서브모듈을 deinit 하고 워크트리를 지운다.
 - **코디네이터 관리**: 멈춘 코디네이터는 `qa-driver restart <PARENT> <KEY>`(기존 브리프로 같은 워크트리에 다시 띄움, 살아 있는 터미널이 있으면 거부), 끝난 티켓의 터미널은 `qa-driver close <PARENT> <KEY>...`.
 - **중지**: 스케줄을 끈다. 상태 디렉터리는 사후 확인을 위해 남긴다.
