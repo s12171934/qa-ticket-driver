@@ -2,7 +2,8 @@
 """qa-driver — one QA parent ticket: pick its open child tickets, give each its own worktree, start a coordinator there.
 
     qa-driver init     <PARENT>                       state directory with config.env / context.md skeletons
-    qa-driver run      <PARENT> [--dry-run|--pending] one round: select tickets, drive each (scheduler entry point)
+    qa-driver run      <PARENT> [--dry-run|--pending] one round: select tickets, drive each, clean up merged ones
+                                                      (scheduler entry point)
     qa-driver drive    <PARENT> <KEY>                 one ticket: worktree (created or reused) + coordinator terminal
     qa-driver worker   <PARENT> <KEY> <SUBMODULE>     coordinator only: worker terminal in the same worktree
     qa-driver status   <PARENT> [--json]              stage of every claimed ticket (exports/state-contract.md)
@@ -18,7 +19,7 @@
                                                       its Orca automation at `qa-driver run`
 
 State lives in $QA_DRIVER_HOME/<parent in lower case>/ (default ~/.qa-driver). --home <dir> points at another home,
-e.g. an older watcher's. Python 3 standard library only; needs the `orca` CLI and git.
+e.g. an older watcher's. Python 3 standard library only; needs the `orca` CLI, git, and `gh` for the merge check.
 """
 import argparse
 import datetime
@@ -36,7 +37,7 @@ import base64
 
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 REF = os.path.join(SKILL_DIR, "references")
-SIGNALS = ("handoffs", "done", "ready", "blocked", "approved", "delivered")  # moved to rounds/ on a reopen
+SIGNALS = ("handoffs", "done", "ready", "blocked", "approved", "delivered", "cleaned")  # moved to rounds/ on a reopen
 
 
 def die(msg, code=1):
@@ -366,13 +367,19 @@ def cmd_run(st, a):
     room = max(0, int(st.get("QA_MAX_ACTIVE", "6")) - len(active(st)))
     take = picks[:min(room, int(st.get("QA_MAX_NEW_PER_RUN", "10")))]
     msg = f"조회 {len(tickets)}건 · 기동 후보 {len(picks)}건 · 동시 상한 여유 {room} → 이번 회차 {len(take)}건"
+    if a.pending or a.dry_run:
+        cleans = merged_cleanups(st)
+        ready = [k for k, _, problems in cleans if not problems]
+        msg += f" · 머지 후 정리 {len(ready)}건"
     if a.pending:
         print(msg, file=sys.stderr)
-        sys.exit(0 if take else 1)
+        sys.exit(0 if take or ready else 1)
     if a.dry_run:
         print(msg)
         for k, s, summ, re_ in take:
             print(f"기동 예정: {k}\t{s}{' (재기동)' if re_ else ''}\t{summ}")
+        for k, plan, problems in cleans:
+            print(f"정리 {'보류' if problems else '예정'}: {k}\t{plan[0][0]}" + (f"\t{' · '.join(problems)}" if problems else ""))
         return
     with Lock(st):
         log(st, msg)
@@ -381,6 +388,7 @@ def cmd_run(st, a):
                 drive(st, key, status, summary, reopen=re_)
             except Exception as e:
                 log(st, f"ERROR {key}: {e}")
+        sweep_merged(st)
 
 
 def cmd_drive(st, a):
@@ -458,23 +466,21 @@ def ticket_worktrees(st, key):
     return [w["path"] for w in ws if not w.get("isMainWorktree") and pat.search(os.path.basename(w.get("path") or ""))]
 
 
-def repo_problems(path):
+def repo_problems(path, merged_heads=()):
     """Uncommitted changes, or commits on the branch that no remote branch holds. Submodule pointer moves in a
-    superproject are not changes of its own (each populated submodule is checked by itself)."""
+    superproject are not changes of its own (each populated submodule is checked by itself). A HEAD that is the head
+    of a merged PR counts as pushed even when a squash merge and a deleted branch leave no remote branch holding it."""
     out = []
     if git(path, "status", "--porcelain", "--ignore-submodules=all"):
         out.append(f"{path}: 커밋하지 않은 변경")
     head = git(path, "rev-parse", "HEAD")
-    if head and not git(path, "branch", "-r", "--contains", head):
+    if head and head not in merged_heads and not git(path, "branch", "-r", "--contains", head):
         out.append(f"{path}: push 되지 않은 커밋 ({head[:9]})")
     return out
 
 
-def cmd_cleanup(st, a):
-    st.load()
-    key, wts = a.key, ticket_worktrees(st, a.key)
-    if not wts:
-        die(f"{key}: 정리할 워크트리가 없다")
+def cleanup_plan(wts, merged_heads=()):
+    """[(worktree, populated submodules)] and what would be lost by removing them."""
     plan, problems = [], []
     for wt in wts:
         subs = []
@@ -483,23 +489,105 @@ def cmd_cleanup(st, a):
                 sub = line.split()[1]
                 if os.path.exists(os.path.join(wt, sub, ".git")):
                     subs.append(sub)
-                    problems += repo_problems(os.path.join(wt, sub))
-        problems += repo_problems(wt)
+                    problems += repo_problems(os.path.join(wt, sub), merged_heads)
+        problems += repo_problems(wt, merged_heads)
         plan.append((wt, subs))
+    return plan, problems
+
+
+def cleanup_execute(st, key, plan, force=False):
+    for wt, subs in plan:
+        for sub in subs:
+            subprocess.run(["git", "-C", wt, "submodule", "deinit", "-f", "--", sub], capture_output=True, timeout=120)
+        orca("worktree", "rm", "--worktree", f"path:{wt}", *(["--force"] if force else []), timeout=300)
+        log(st, f"CLEANUP {key} {wt}")
+    os.makedirs(st.p("cleaned"), exist_ok=True)
+    with open(st.p("cleaned", key), "w", encoding="utf-8") as f:
+        f.write(f"{now()}\t{' '.join(wt for wt, _ in plan)}\n")
+
+
+def cmd_cleanup(st, a):
+    st.load()
+    key, wts = a.key, ticket_worktrees(st, a.key)
+    if not wts:
+        die(f"{key}: 정리할 워크트리가 없다")
+    plan, problems = cleanup_plan(wts, merged_heads(st, key))
     for wt, subs in plan:
         print(f"정리: {wt}" + (f" (deinit: {', '.join(subs)})" if subs else ""))
     if problems and not a.force:
         die("멈춤 — " + " · ".join(problems) + " (--force 로 무시)", 3)
     if a.dry_run:
         return
-    for wt, subs in plan:
-        for sub in subs:
-            subprocess.run(["git", "-C", wt, "submodule", "deinit", "-f", "--", sub], capture_output=True, timeout=120)
-        orca("worktree", "rm", "--worktree", f"path:{wt}", *(["--force"] if a.force else []), timeout=300)
-        log(st, f"CLEANUP {key} {wt}")
-    os.makedirs(st.p("cleaned"), exist_ok=True)
-    with open(st.p("cleaned", key), "w", encoding="utf-8") as f:
-        f.write(f"{now()}\t{' '.join(wts)}\n")
+    cleanup_execute(st, key, plan, a.force)
+
+
+PR_URL = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/pull/\d+")
+
+
+def delivered_prs(st, key):
+    """{PR url: (state, head oid)} for every PR named in delivered/<KEY>.md. Raises when gh cannot answer."""
+    try:
+        text = open(st.p("delivered", f"{key}.md"), encoding="utf-8").read()
+    except OSError:
+        return {}
+    prs = {}
+    for url in dict.fromkeys(PR_URL.findall(text)):
+        r = subprocess.run(["gh", "pr", "view", url, "--json", "state,headRefOid"], capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            raise RuntimeError(f"gh pr view {url}: {r.stderr.strip()[:200]}")
+        d = json.loads(r.stdout)
+        prs[url] = (d["state"], d["headRefOid"])
+    return prs
+
+
+def merged_heads(st, key):
+    try:
+        return {head for state, head in delivered_prs(st, key).values() if state == "MERGED"}
+    except (RuntimeError, OSError) as e:
+        print(f"qa-driver: {key} PR 조회 실패, 머지 판정 없이 정리 검사 — {e}", file=sys.stderr)
+        return set()
+
+
+def merged_cleanups(st):
+    """Delivered tickets whose driver-made worktree still exists and whose PRs are all merged:
+    [(key, plan, problems)]. Only worktrees the driver recorded — never a name-matched guess."""
+    out = []
+    for r in status_rows(st):
+        wt = (st.ticket(r["key"]).get("worktree") or {}).get("path")
+        if r["stage"] != "delivered" or not (wt and os.path.isdir(wt)):
+            continue
+        try:
+            prs = delivered_prs(st, r["key"])
+        except (RuntimeError, OSError) as e:
+            print(f"qa-driver: {r['key']} PR 조회 실패, 이번 회차 정리 건너뜀 — {e}", file=sys.stderr)
+            continue
+        if prs and all(state == "MERGED" for state, _ in prs.values()):
+            plan, problems = cleanup_plan([wt], {head for _, head in prs.values()})
+            out.append((r["key"], plan, problems))
+    return out
+
+
+def sweep_merged(st):
+    """Close the live terminals of each merged ticket and remove its worktree. A ticket with something unpushed
+    stays and is logged once per distinct reason."""
+    for key, plan, problems in merged_cleanups(st):
+        t = st.ticket(key)
+        if problems:
+            reason = " · ".join(problems)
+            if t.get("cleanup_skip") != reason:
+                t["cleanup_skip"] = reason
+                st.save_ticket(t)
+                log(st, f"CLEANUP-SKIP {key}: {reason}")
+            continue
+        live = live_handles()
+        for h in ticket_handles(st, key):
+            if h in live:
+                orca("terminal", "close", "--terminal", h, timeout=60)
+                log(st, f"CLOSE {key} {h}")
+        try:
+            cleanup_execute(st, key, plan)
+        except Exception as e:
+            log(st, f"ERROR cleanup {key}: {e}")
 
 
 def ticket_handles(st, key):

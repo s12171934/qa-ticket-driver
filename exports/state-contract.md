@@ -1,7 +1,7 @@
 ---
 title: qa-ticket-driver 상태 계약
 created: 2026-10-21
-updated: 2026-10-21
+updated: 2026-10-22
 tags: [domain/인공지능, area/ai에이전트]
 source: ai
 ---
@@ -25,12 +25,12 @@ source: ai
 | `ready/<KEY>.md` | 코디네이터 | 검토 완료 — 반출 승인 대기 |
 | `approved/<KEY>.md` | 사용자(대시보드·`qa-driver approve`) | 반출(push·PR) 승인 |
 | `delivered/<KEY>.md` | 코디네이터 | 저장소별 PR 주소 |
-| `cleaned/<KEY>` | `qa-driver cleanup` | 워크트리 정리 완료 |
+| `cleaned/<KEY>` | 드라이버(`run` 회차 · `qa-driver cleanup`) | 워크트리 정리 완료. `run` 은 `delivered/<KEY>.md` 의 PR 이 모두 머지되면 정리한다 |
 | `blocked/<KEY>[-<이름>].md` | 코디네이터·워커 | 막힘. 셋째 줄이 한 줄 요약 |
 | `ignored/<KEY>` | 사용자 | 선별에서 제외 |
 | `retired` | `qa-driver retire` | QA 종료 처리 시각 |
 | `rounds/<KEY>/<n>/<종류>/` | 드라이버 | 재오픈 때 옮긴 이전 회차 신호 |
-| `log/<YYYYMMDD>.log` | 드라이버 | 회차·기동·승인·정리 기록 |
+| `log/<YYYYMMDD>.log` | 드라이버 | 회차·기동·승인·정리 기록 (`CLEANUP-SKIP` = 머지됐지만 남길 것이 있어 정리 보류) |
 
 `<이름>` 은 서브모듈 경로의 `/` 를 `-` 로 바꾼 것(서브모듈이 없는 저장소는 `root`).
 
