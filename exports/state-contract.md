@@ -27,7 +27,7 @@ source: ai
 | `delivered/<KEY>.md` | 코디네이터 | 저장소별 PR 주소 |
 | `merge/<KEY>.md` | 사용자(대시보드·`qa-driver merge`) | PR 머지 지시. 단계가 아니라 `delivered` 에 덧붙는 표시 |
 | `cleaned/<KEY>` | 드라이버(`run` 회차 · `qa-driver cleanup`) | 워크트리 정리 완료. `run` 은 `delivered/<KEY>.md` 의 PR 이 모두 머지되거나, PR 이 없고 Jira 상태가 `QA_STATUS_DONE` 중 하나면 정리한다. 열린 PR 이 있으면 남긴다 |
-| `blocked/<KEY>[-<이름>].md` | 코디네이터·워커 | 막힘. 셋째 줄이 한 줄 요약 |
+| `blocked/<KEY>[-<이름>].md` | 코디네이터·워커 | 막힘. 셋째 줄이 한 줄 요약. 정리(`cleaned/<KEY>`)할 때 드라이버가 지운다 |
 | `ignored/<KEY>` | 사용자 | 선별에서 제외 |
 | `retired` | `qa-driver retire` | QA 종료 처리 시각 |
 | `rounds/<KEY>/<n>/<종류>/` | 드라이버 | 재오픈 때 옮긴 이전 회차 신호 |

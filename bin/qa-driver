@@ -576,6 +576,11 @@ def cleanup_execute(st, key, plan):
     os.makedirs(st.p("cleaned"), exist_ok=True)
     with open(st.p("cleaned", key), "w", encoding="utf-8") as f:
         f.write(f"{now()}\t{' '.join(wt for wt, _ in plan)}\n")
+    # Cleanup runs once the PRs are merged (or Jira closed the ticket), so a 막힘 left from before — a merge conflict
+    # the coordinator then resolved — is settled; left in place it would keep the ticket in 내 차례.
+    for f in st.has("blocked", key):
+        os.remove(st.p("blocked", f))
+        log(st, f"UNBLOCK {key} {f} (cleaned)")
 
 
 def cmd_cleanup(st, a):
