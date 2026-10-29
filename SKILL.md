@@ -34,7 +34,11 @@ description: QA 부모 티켓(릴리스 QA 에픽 등) 하나를 주기적으로
 2. **방향 게이트를 여기서 한 번 묻는다.** 「원인·방향이 코드로 확정되면 묻지 않고 구현할까요?」 — 답을 `QA_AUTO_HANDOFF=yes|no` 로 적는다. 추측해 채우지 않는다(비어 있으면 `run` 이 거부한다).
 3. `config.env` 의 나머지(필수: `JIRA_SITE` `JIRA_EMAIL` `QA_REPO` `QA_STATUS_NEW` `QA_STATUS_REOPEN`, 토큰 키체인)와 `context.md` 를 채운다. **기능 전용 지식은 `context.md` 에만** 쓴다.
 4. `qa-driver run <PARENT> --dry-run` — 부작용 없이 토큰·JQL·기동될 티켓을 확인한다.
-5. 스케줄을 건다. Orca automation 이 기본이다(Orca 에서 보이고 대시보드에서 켜고 끌 수 있다):
+5. **TC 시트 링크를 여기서 한 번 묻는다.** 「QA 진행도를 대시보드에 띄울 TC 스프레드시트 링크가 있나요?」 — 없다고 하면 건너뛴다. 추측해 채우지 않는다. 링크가 있으면:
+   - 링크의 `/d/<fileId>/` 에서 fileId 를 뽑고, 6번 자동화 프롬프트의 「다른 일은 하지 않는다.」 앞에 다음을 넣는다: `그다음 TC 시트 진행도를 갱신한다: Google Drive 커넥터의 download_file_content 를 fileId <fileId> 로(exportMimeType 없이) 호출하고, 받은 content 문자열을 그대로 <agent-dashboard>/server/aqa sheet <PARENT> '<content>' 로 넘긴 뒤 aqa 의 출력 한 줄을 보고하라. 시트 갱신이 실패해도 드라이버 결과는 그대로 보고한다.`
+   - agent-dashboard 의 `server/prefs.json` `qa_sets` 에서 이 에픽 항목에 `"sheet": "<링크>"` 를 넣고(항목이 없으면 `epic`·`project`·`watch` 와 함께 더한다) 대시보드 서버를 재시작한다(`launchctl kickstart -k gui/$(id -u)/local.agent-dashboard`, prefs 는 시작할 때만 읽는다).
+   - 시트의 첫 탭이 「Test Summary」 양식(총 TC·Pass·Fail·Blocked·Dropped·N-Test)이어야 한다. 처음 한 번 위 문장대로 직접 받아 `aqa` 가 읽는지 확인한다. 갱신은 에이전트가 뜨는 회차에만 일어난다(precheck 가 건너뛰는 회차에는 없음).
+6. 스케줄을 건다. Orca automation 이 기본이다(Orca 에서 보이고 대시보드에서 켜고 끌 수 있다):
    ```bash
    orca automations create --name "<PARENT> QA 드라이버" --trigger "*/10 * * * *" --workspace path:<QA_REPO> \
      --precheck "<스킬>/bin/qa-driver run <PARENT> --pending" \
