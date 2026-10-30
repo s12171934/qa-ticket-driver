@@ -6,9 +6,13 @@
                                                       (scheduler entry point)
     qa-driver drive    <PARENT> <KEY>                 one ticket: worktree (created or reused) + coordinator terminal
     qa-driver worker   <PARENT> <KEY> <SUBMODULE>     coordinator only: worker terminal in the same worktree
+    qa-driver worker   <PARENT> <KEY> --screen        coordinator only: screen-measurement worker in the same worktree
     qa-driver status   <PARENT> [--json]              stage of every claimed ticket (exports/state-contract.md)
     qa-driver approve  <PARENT> <KEY> [--force]       record push/PR approval and tell the coordinator
     qa-driver merge    <PARENT> <KEY>                 delivered ticket: record the merge order and tell the coordinator
+    qa-driver tell     <PARENT> --to <HANDLE> --body <TEXT|-> [--type T] [--subject S] [--key KEY]
+                                                      type a message into another agent's terminal and log it
+                                                      (log/tell.jsonl — the dashboard's interaction tab reads it)
     qa-driver cleanup  <PARENT> <KEY> [--force|--dry-run]  deinit submodules and remove the ticket worktree
     qa-driver ignore   <PARENT> <KEY> [--undo]        keep a ticket out of selection
     qa-driver restart  <PARENT> <KEY> [--force]       start the ticket's coordinator again with its existing brief
@@ -38,6 +42,7 @@ import base64
 
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 REF = os.path.join(SKILL_DIR, "references")
+TELL_TYPES = ("dispatch", "status", "question", "answer", "escalation", "handoff", "merge_ready", "decision_gate")
 SIGNALS = ("handoffs", "done", "ready", "blocked", "approved", "delivered", "merge", "cleaned")  # moved to rounds/ on a reopen
 
 
@@ -235,8 +240,8 @@ def stage_of(st, key):
     for kind, stage in (("delivered", "delivered"), ("approved", "approved"), ("ready", "committed")):
         if f"{key}.md" in st.has(kind, key):
             return stage
-    hand = [f for f in st.has("handoffs", key) if not f.endswith("-deliver.md")]
-    done = st.has("done", key)
+    hand = [f for f in st.has("handoffs", key) if not f.endswith(("-deliver.md", "-screen.md"))]
+    done = [f for f in st.has("done", key) if not f.endswith("-screen.md")]
     if hand and done and len(done) >= len(hand):
         return "reviewing"
     if hand:
@@ -275,6 +280,7 @@ def render(st, out, templates, key, extra=None):
             "REPO": st.get("QA_REPO"), "JIRA_SITE": st.get("JIRA_SITE").removeprefix("https://").rstrip("/"),
             "JIRA_EMAIL": st.get("JIRA_EMAIL"), "HARNESS_DOCS": st.get("QA_HARNESS_DOCS", "AGENTS.md"),
             "TICKET_SKILLS": st.get("QA_TICKET_SKILLS") or "(없음 — 하네스 문서의 규칙을 따른다)",
+            "SCREEN_SKILLS": st.get("QA_SCREEN_SKILLS") or "(없음 — 인계 브리프가 정한 방법을 따른다)",
             "DRIVER": os.path.join(SKILL_DIR, "bin", "qa-driver"), "HOME_OPT": f'--home "{st.home}"',
             "TOKEN_HINT": f'`security find-generic-password -s {st.get("QA_JIRA_TOKEN_KEYCHAIN_SERVICE")} -w`'
             if st.get("QA_JIRA_TOKEN_KEYCHAIN_SERVICE") else "사용자에게 묻는다", **(extra or {})}
@@ -302,9 +308,30 @@ def start_agent(st, worktree, title, prompt_file, intro):
         orca("terminal", "wait", "--terminal", handle, "--for", "tui-idle", "--timeout-ms", "120000", timeout=150)
     except Exception:
         pass  # an agent that never reports idle still takes the text
-    orca("terminal", "send", "--terminal", handle, "--text",
-         f"Read the file {prompt_file} and follow its instructions exactly. {intro}", "--enter")
+    key = re.match(r"[A-Z][A-Z0-9]+-\d+", title)
+    tell(st, handle, f"Read the file {prompt_file} and follow its instructions exactly. {intro}",
+         "dispatch", f"{title} 시작", key[0] if key else "")
     return handle
+
+
+def tell(st, handle, text, kind="status", subject="", key="", sender=None):
+    """Type text into another agent's terminal and add one line to log/tell.jsonl. Orca keeps no history of terminal
+    input, and an inbox copy would sit unread in the receiver's mailbox, so the dashboard's interaction tab reads this log."""
+    rec = {"at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+           "from": sender or os.environ.get("ORCA_TERMINAL_HANDLE") or "qa-driver", "to": handle, "type": kind,
+           "subject": subject, "body": text, "key": key, "parent": st.parent, "ok": True}
+    try:
+        orca("terminal", "send", "--terminal", handle, "--text", text, "--enter")
+    except Exception as e:
+        rec.update(ok=False, error=str(e)[:300])
+        raise
+    finally:
+        try:
+            os.makedirs(st.p("log"), exist_ok=True)
+            with open(st.p("log", "tell.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except OSError:
+            pass  # a missing record never blocks the message
 
 
 def live_handles():
@@ -358,7 +385,8 @@ def drive(st, key, status="", summary="", reopen=False):
         log(st, f"WORKTREE {key} {wt}")
     templates = (["brief-reopen.md"] if rnd > 1 else []) + ["brief-coordinator.md"]
     brief = render(st, st.p("briefs", f"{key}.md"), templates, key, {"WORKTREE": wt, "ROUND": rnd})
-    render(st, st.p("worker-duties.md"), ["worker-duties.md"], "<티켓키>", {"WORKTREE": "<워크트리>", "ROUND": "<회차>"})
+    for duties in ("worker-duties.md", "screen-duties.md"):
+        render(st, st.p(duties), [duties], "<티켓키>", {"WORKTREE": "<워크트리>", "ROUND": "<회차>"})
     handle = start_agent(st, wt, f"{key} 코디네이터", brief, "그 파일의 지시를 그대로 수행하라.")
     os.makedirs(st.p("claimed"), exist_ok=True)
     with open(st.p("claimed", key), "a", encoding="utf-8") as f:
@@ -423,14 +451,18 @@ def cmd_worker(st, a):
     wt = (t.get("worktree") or {}).get("path")
     if not wt:
         die(f"{a.key} 의 워크트리 기록이 없다 (qa-driver drive 로 기동한 티켓만)")
-    name = re.sub(r"[^A-Za-z0-9._-]+", "-", a.submodule.strip("/")) if a.submodule != "." else "root"
+    if a.screen == bool(a.submodule):
+        die("서브모듈 경로와 --screen 중 하나만 준다")
+    name = "screen" if a.screen else re.sub(r"[^A-Za-z0-9._-]+", "-", a.submodule.strip("/")) if a.submodule != "." else "root"
     hand = st.p("handoffs", f"{a.key}-{name}.md")
     if not os.path.isfile(hand):
         die(f"{hand} 가 없다 — 인계 브리프를 먼저 쓴다")
-    render(st, st.p("worker-duties.md"), ["worker-duties.md"], "<티켓키>", {"WORKTREE": "<워크트리>", "ROUND": "<회차>"})
+    duties = "screen-duties.md" if a.screen else "worker-duties.md"
+    render(st, st.p(duties), [duties], "<티켓키>", {"WORKTREE": "<워크트리>", "ROUND": "<회차>"})
+    role = "화면 실측을 맡는다" if a.screen else f"너의 저장소는 {a.submodule}"
     handle = start_agent(st, wt, f"{a.key} 워커 {name}", hand,
-                         f"그 다음 {st.p('worker-duties.md')} 의 의무를 따른다. 너의 저장소는 {a.submodule}, 신호 파일 이름은 {a.key}-{name}.md 다.")
-    t.setdefault("workers", {})[name] = {"handle": handle, "submodule": a.submodule, "at": now()}
+                         f"그 다음 {st.p(duties)} 의 의무를 따른다. {role}, 신호 파일 이름은 {a.key}-{name}.md 다.")
+    t.setdefault("workers", {})[name] = {"handle": handle, "submodule": a.submodule or "", "at": now()}
     st.save_ticket(t)
     log(st, f"WORKER {a.key} {name} ({handle})")
     print(handle)
@@ -464,7 +496,7 @@ def tell_coordinator(st, key, text, title, purpose, signal):
     t, cl = st.ticket(key), st.claims(key)
     handle = (t.get("coordinator") or {}).get("handle") or (cl[-1][2] if cl and len(cl[-1]) > 2 else None)
     if handle and handle in live_handles():
-        orca("terminal", "send", "--terminal", handle, "--text", text, "--enter")
+        tell(st, handle, text, "dispatch", f"{key} {title}", key)
         print(f"전달: {handle}")
         return
     wt = (t.get("worktree") or {}).get("path")
@@ -475,6 +507,16 @@ def tell_coordinator(st, key, text, title, purpose, signal):
     t["coordinator"] = {"handle": h, "at": now(), "round": t.get("round"), "for": purpose}
     st.save_ticket(t)
     print(f"새 코디네이터: {h}")
+
+
+def cmd_tell(st, a):
+    if not os.path.isdir(st.dir):
+        die(f"{st.dir} 없음 — 부모 티켓·--home 을 확인한다")
+    body = sys.stdin.read().rstrip("\n") if a.body == "-" else a.body
+    if not body.strip():
+        die("--body 가 비었다")
+    tell(st, a.to, body, a.type, a.subject, a.key or "", a.sender)
+    print(f"전달: {a.to}")
 
 
 def cmd_merge(st, a):
@@ -515,8 +557,13 @@ def ticket_worktrees(st, key):
 def merged_into_base(path, head):
     """HEAD is already in a base branch the remote holds (origin/HEAD, main, master, develop, support/*) — a branch
     with nothing of its own, or one merged with a merge commit / fast-forward."""
-    bases = [r for r in (git(path, "for-each-ref", "--format=%(refname:short)", "refs/remotes/origin") or "").splitlines()
-             if r in ("origin", "origin/main", "origin/master", "origin/develop") or r.startswith("origin/support/")]
+    remotes = (git(path, "for-each-ref", "--format=%(refname:short)", "refs/remotes/origin") or "").splitlines()
+    # 분리된 HEAD 는 확인용 체크아웃(예: 실측이 채운 web-dev 서브모듈)이라 원격 어느 브랜치에든 있으면 남길 것이 없다.
+    if git(path, "rev-parse", "--abbrev-ref", "HEAD") == "HEAD":
+        bases = [r for r in remotes if r != "origin/HEAD"]
+    else:
+        bases = [r for r in remotes
+                 if r in ("origin", "origin/main", "origin/master", "origin/develop") or r.startswith("origin/support/")]
     return any(subprocess.run(["git", "-C", path, "merge-base", "--is-ancestor", head, b], capture_output=True).returncode == 0
                for b in bases)
 
@@ -626,24 +673,27 @@ def merged_heads(st, key):
 
 
 def finished_cleanups(st, done_keys):
-    """Tickets whose driver-made worktree still exists and that are finished — every PR in delivered/<KEY>.md
+    """Tickets with a driver-recorded worktree (still present, or already removed outside the driver) that are finished — every PR in delivered/<KEY>.md
     merged, or no PR at all and the Jira status is one of QA_STATUS_DONE (a ticket closed without a fix):
     [(key, plan, problems)]. An open PR keeps the worktree whatever Jira says — the merge step still needs it.
     Only worktrees the driver recorded — never a name-matched guess."""
     out = []
     for r in status_rows(st):
         wt = (st.ticket(r["key"]).get("worktree") or {}).get("path")
-        if r["stage"] == "cleaned" or not (wt and os.path.isdir(wt)):
+        if r["stage"] == "cleaned" or not wt:
             continue
-        if r["stage"] != "delivered" and r["key"] not in done_keys:
+        # 2회차부터 Jira 완료 상태는 이전 회차 머지의 잔상일 수 있어, 이번 회차 반출 PR 머지로만 정리한다.
+        no_fix_closable = r["key"] in done_keys and len(st.claims(r["key"])) <= 1
+        if r["stage"] != "delivered" and not no_fix_closable:
             continue
         try:
             prs = delivered_prs(st, r["key"])
         except (RuntimeError, OSError) as e:
             print(f"qa-driver: {r['key']} PR 조회 실패, 이번 회차 정리 건너뜀 — {e}", file=sys.stderr)
             continue
-        if prs and all(state == "MERGED" for state, _ in prs.values()) or not prs and r["key"] in done_keys:
-            plan, problems = cleanup_plan([wt], {head for _, head in prs.values()})
+        if prs and all(state == "MERGED" for state, _ in prs.values()) or not prs and no_fix_closable:
+            # 드라이버 밖에서 이미 지운 워크트리는 지울 것 없이 정리 표시만 남긴다.
+            plan, problems = cleanup_plan([wt] if os.path.isdir(wt) else [], {head for _, head in prs.values()})
             out.append((r["key"], plan, problems))
     return out
 
@@ -822,7 +872,7 @@ def main():
     ap = argparse.ArgumentParser(prog="qa-driver", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--home", help="state home (default $QA_DRIVER_HOME or ~/.qa-driver)")
     sp = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("init", "run", "drive", "worker", "status", "approve", "merge", "cleanup", "ignore", "restart", "close", "retire", "adopt"):
+    for name in ("init", "run", "drive", "worker", "status", "approve", "merge", "tell", "cleanup", "ignore", "restart", "close", "retire", "adopt"):
         p = sp.add_parser(name)
         p.add_argument("parent")
         if name in ("drive", "worker", "approve", "merge", "cleanup", "ignore", "restart"):
@@ -839,7 +889,8 @@ def main():
             p.add_argument("--set", action="append", default=[])
             p.add_argument("--automation")
         if name == "worker":
-            p.add_argument("submodule")
+            p.add_argument("submodule", nargs="?")
+            p.add_argument("--screen", action="store_true")
         if name == "run":
             g = p.add_mutually_exclusive_group()
             g.add_argument("--dry-run", action="store_true")
@@ -855,6 +906,13 @@ def main():
             p.add_argument("--dry-run", action="store_true")
         if name == "ignore":
             p.add_argument("--undo", action="store_true")
+        if name == "tell":
+            p.add_argument("--to", required=True, help="receiver's terminal handle (term_...)")
+            p.add_argument("--type", default="status", choices=TELL_TYPES)
+            p.add_argument("--subject", default="")
+            p.add_argument("--body", required=True, help="text typed into the terminal; - reads stdin")
+            p.add_argument("--key", help="ticket key")
+            p.add_argument("--from", dest="sender", help="sender (default $ORCA_TERMINAL_HANDLE)")
     a = ap.parse_args()
     for k in ([a.key] if getattr(a, "key", None) else []) + (getattr(a, "keys", None) or []):
         if not re.fullmatch(r"[A-Z][A-Z0-9]+-\d+", k):
