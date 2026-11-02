@@ -22,7 +22,7 @@ description: QA 부모 티켓(릴리스 QA 에픽 등) 하나를 주기적으로
 ## 파일
 | 위치 | 내용 |
 | --- | --- |
-| `bin/qa-driver` | CLI — `init` · `run` · `drive` · `worker` · `status` · `approve` · `merge` · `tell` · `cleanup` · `ignore` · `restart` · `close` · `retire` · `adopt` (`qa-driver --help`) |
+| `bin/qa-driver` | CLI — `init` · `run` · `drive` · `worker` · `status` · `approve` · `merge` · `tell` · `cleanup` · `sweep` · `ignore` · `restart` · `close` · `retire` · `adopt` (`qa-driver --help`) |
 | `references/brief-coordinator.md` · `brief-reopen.md` | 코디네이터 브리프 (재오픈 = 머리말 + 본 브리프) |
 | `references/worker-duties.md` · `screen-duties.md` | 코드 워커·화면 실측 워커 의무. 드라이버가 상태 디렉터리로 렌더한다 |
 | `references/config.env.example` · `context.md.example` | `init` 이 복사하는 견본 |
@@ -61,10 +61,10 @@ description: QA 부모 티켓(릴리스 QA 에픽 등) 하나를 주기적으로
 
 ## 사람이 하는 일
 - **현황**: `qa-driver status <PARENT>` (또는 상태 계약을 읽는 대시보드).
-- **승인**: `ready/` 의 검증(특히 red 확인)을 읽고 `qa-driver approve <PARENT> <KEY>` — `approved/<KEY>.md` 를 남기고 코디네이터 터미널에 알린다(닫혔으면 그 워크트리에 반출용 코디네이터를 새로 띄운다).
-- **머지 지시**: 반출된(`delivered/`) 티켓의 PR 을 확인하고 `qa-driver merge <PARENT> <KEY>` — `merge/<KEY>.md` 를 남기고 코디네이터 터미널에 머지를 지시한다(닫혔으면 새로 띄운다). 코디네이터는 의존 저장소부터 머지하고, 못 하면 `blocked/` 에 사유를 남긴다.
+- **승인**: `ready/` 의 검증(특히 red 확인)을 읽고 `qa-driver approve <PARENT> <KEY>` — `approved/<KEY>.md` 를 남기고 코디네이터 터미널에 알린다(닫혔으면 그 워크트리에 반출용 코디네이터를 새로 띄운다). 이번 회차를 workflow-canvas 플로가 돌리면(`claimed/<KEY>` 마지막 줄의 셋째 칸이 `canvas-`) 코디네이터를 띄우지 않고 그 실행의 반출 승인 게이트에 승인을 넣는다 — 캔버스 코디네이터가 이어받고, 같은 질문을 터미널에서 묻던 워커에게도 알린다. 캔버스가 받지 못하면(서버 꺼짐·이미 거절됨) 아무것도 남기지 않고 실패한다.
+- **머지 지시**: 반출된(`delivered/`) 티켓의 PR 을 확인하고 `qa-driver merge <PARENT> <KEY>` — `merge/<KEY>.md` 를 남기고 코디네이터 터미널에 머지를 지시한다(닫혔으면 새로 띄운다. 캔버스 플로가 돌리는 티켓이면 승인과 같이 그 실행의 머지 지시 게이트에 넣는다). 코디네이터는 의존 저장소부터 머지하고, 못 하면 `blocked/` 에 사유를 남긴다.
 - **세션 사이 메시지**: 드라이버·코디네이터·워커가 다른 세션의 터미널에 말을 넣을 때는 `qa-driver tell <PARENT> --to <handle> --type <종류> --subject … --body …` 를 쓴다. `orca terminal send` 로 입력하고 `log/tell.jsonl` 에 한 줄 남긴다(대시보드 상호작용 탭이 읽는다). 일반 터미널로 도는 코디네이터는 오케스트레이션 inbox 를 확인하지 않으므로 inbox 로 보내지 않는다. 드라이버의 승인·머지 지시와 기동 프롬프트도 이 경로로 간다.
-- **정리**: `run` 회차가 `delivered/<KEY>.md` 의 PR 이 모두 머지됐거나, PR 없이 Jira 상태가 `QA_STATUS_DONE` 중 하나인 1회차 티켓(코드 수정 없이 끝난 티켓 — 2회차부터는 Jira 상태가 이전 회차 머지의 잔상일 수 있어 이번 회차 PR 머지로만 정리한다)을 — 열린 PR 이 있으면 Jira 상태와 무관하게 남긴다 — 찾아 그 터미널을 닫고 워크트리를 지운다(`gh` 필요, 드라이버가 만든 워크트리만). 지우기 전에 워크트리와 populate 된 서브모듈마다 HEAD 가 머지됐는지 확인한다(원격 베이스 브랜치에 들어 있거나, 머지된 PR 의 head — squash 대비 `delivered/` 기록과 `gh pr list --state merged`). 커밋하지 않은 변경이나 머지되지 않은 커밋이 있으면 남기고 로그에 `CLEANUP-SKIP` 을 한 번 적는다. 손으로는 `qa-driver cleanup <PARENT> <KEY>` — 같은 검사 뒤 서브모듈을 deinit 하고 워크트리를 지운다.
+- **정리**: `run` 회차가 `delivered/<KEY>.md` 의 PR 이 모두 머지됐거나, PR 없이 Jira 상태가 `QA_STATUS_DONE` 중 하나인 1회차 티켓(코드 수정 없이 끝난 티켓 — 2회차부터는 Jira 상태가 이전 회차 머지의 잔상일 수 있어 이번 회차 PR 머지로만 정리한다)을 — 열린 PR 이 있으면 Jira 상태와 무관하게 남긴다 — 찾아 그 터미널을 닫고 워크트리를 지운다(`gh` 필요, 드라이버가 만든 워크트리만). 지우기 전에 워크트리와 populate 된 서브모듈마다 HEAD 가 머지됐는지 확인한다(원격 베이스 브랜치에 들어 있거나, 머지된 PR 의 head — squash 대비 `delivered/` 기록과 `gh pr list --state merged`). 커밋하지 않은 변경이나 머지되지 않은 커밋이 있으면 남기고 로그에 `CLEANUP-SKIP` 을 한 번 적는다. 손으로는 `qa-driver cleanup <PARENT> <KEY>` — 같은 검사 뒤 서브모듈을 deinit 하고 워크트리를 지운다. `qa-driver sweep <PARENT> [--dry-run]` 은 `run` 회차의 정리만 한다(선별·기동 없음) — workflow-canvas 플로처럼 드라이버 회차 없이 도는 쪽이 **티켓 워크트리 밖에서** 부른다. 워크트리 안에서 지우면 그 안의 터미널(지우는 쪽 자신 포함)이 함께 닫힌다. 캔버스 실행이 맡은 티켓은 그 실행이 끝난 뒤(실행 로그 completed·failed)에만 지운다. 정리 검사는 다른 체크아웃을 가리키는 추적 안 된 `node_modules` 심링크와, Next.js 가 참조 줄만 덧붙인 `next-env.d.ts` 를 변경으로 치지 않는다.
 - **코디네이터 관리**: 멈춘 코디네이터는 `qa-driver restart <PARENT> <KEY>`(기존 브리프로 같은 워크트리에 다시 띄움, 살아 있는 터미널이 있으면 거부), 끝난 티켓의 터미널은 `qa-driver close <PARENT> <KEY>...`.
 - **중지**: 스케줄을 끈다. 상태 디렉터리는 사후 확인을 위해 남긴다.
 - **QA 종료**: `qa-driver retire <PARENT> --dry-run` 으로 확인한 뒤 `retire` — 에픽을 부르는 자동화를 끄고, 옛 워처의 공용 조정 워크트리(`QA_COORD_WORKTREE`)가 있으면 그 터미널을 닫고 지운다. 검토 전 티켓이 남아 있거나 조정 워크트리에 커밋하지 않은 파일이 있으면 멈춘다.

@@ -23,10 +23,10 @@ source: ai
 | `handoffs/<KEY>-<이름>.md` | 코디네이터 | 서브모듈별 인계 브리프. 있으면 그 워커가 기동됐다. `<KEY>-screen.md` 는 화면 실측 인계 |
 | `done/<KEY>-<이름>.md` | 워커 | 서브모듈별 커밋 완료. `<KEY>-screen.md` 는 화면 실측 결과 |
 | `ready/<KEY>.md` | 코디네이터 | 검토 완료 — 반출 승인 대기 |
-| `approved/<KEY>.md` | 사용자(대시보드·`qa-driver approve`) | 반출(push·PR) 승인 |
+| `approved/<KEY>.md` | 사용자(대시보드·`qa-driver approve`) 또는 캔버스 플로의 반출 단계 | 반출(push·PR) 승인. 어디서 골랐든 같은 파일 하나다 — 캔버스가 돌리는 티켓은 `qa-driver approve` 가 캔버스 게이트에도 넣는다 |
 | `delivered/<KEY>.md` | 코디네이터 | 저장소별 PR 주소 |
-| `merge/<KEY>.md` | 사용자(대시보드·`qa-driver merge`) | PR 머지 지시. 단계가 아니라 `delivered` 에 덧붙는 표시 |
-| `cleaned/<KEY>` | 드라이버(`run` 회차 · `qa-driver cleanup`) | 워크트리 정리 완료. `run` 은 `delivered/<KEY>.md` 의 PR 이 모두 머지되거나, PR 이 없고 Jira 상태가 `QA_STATUS_DONE` 중 하나인 1회차 티켓이면 정리한다(2회차부터는 이번 회차 PR 머지로만). 열린 PR 이 있으면 남긴다 |
+| `merge/<KEY>.md` | 사용자(대시보드·`qa-driver merge`) 또는 캔버스 플로의 머지 단계 | PR 머지 지시(캔버스가 돌리는 티켓은 캔버스 게이트에도 넣는다). 단계가 아니라 `delivered` 에 덧붙는 표시 |
+| `cleaned/<KEY>` | 드라이버(`run` 회차 · `qa-driver sweep` · `qa-driver cleanup`) | 워크트리 정리 완료. `run` 은 `delivered/<KEY>.md` 의 PR 이 모두 머지되거나, PR 이 없고 Jira 상태가 `QA_STATUS_DONE` 중 하나인 1회차 티켓이면 정리한다(2회차부터는 이번 회차 PR 머지로만). 열린 PR 이 있으면 남긴다 |
 | `blocked/<KEY>[-<이름>].md` | 코디네이터·워커 | 막힘. 셋째 줄이 한 줄 요약. 정리(`cleaned/<KEY>`)할 때 드라이버가 지운다 |
 | `ignored/<KEY>` | 사용자 | 선별에서 제외 |
 | `retired` | `qa-driver retire` | QA 종료 처리 시각 |

@@ -14,6 +14,8 @@
                                                       type a message into another agent's terminal and log it
                                                       (log/tell.jsonl — the dashboard's interaction tab reads it)
     qa-driver cleanup  <PARENT> <KEY> [--force|--dry-run]  deinit submodules and remove the ticket worktree
+    qa-driver sweep    <PARENT> [--dry-run]           only the clean-up of a round: remove the worktrees of finished
+                                                      tickets (run from outside them — the workflow-canvas select flow)
     qa-driver ignore   <PARENT> <KEY> [--undo]        keep a ticket out of selection
     qa-driver restart  <PARENT> <KEY> [--force]       start the ticket's coordinator again with its existing brief
     qa-driver close    <PARENT> <KEY>...              close the tickets' live coordinator / worker terminals
@@ -37,6 +39,7 @@ import subprocess
 import sys
 import time
 from urllib.parse import urlencode
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 import base64
 
@@ -477,16 +480,83 @@ def cmd_status(st, a):
         print(f'{r["key"]:<10} {r["stage"]:<12}{" 막힘" if r["blocked"] else ""}{" 제외" if r["ignored"] else ""} {r["round"]}회차  {r["summary"][:60]}')
 
 
+# Gates of the workflow-canvas QA flow (examples/qa-ticket-solve.json) that a dashboard signal answers.
+CANVAS_GATES = {"approved": "deliver-gate", "merge": "merge-gate"}
+
+
+def canvas_owned(st, key):
+    """The ticket's current round runs as a workflow-canvas flow: its latest claim was written by the canvas
+    (canvas-select: / canvas-manual:), so it has no driver coordinator to tell."""
+    cl = st.claims(key)
+    return bool(cl) and len(cl[-1]) > 2 and cl[-1][2].startswith("canvas-")
+
+
+def canvas_decide(st, key, signal, by):
+    """Approve the canvas run's gate for this signal, as the user. The run's coordinator takes it from there and,
+    when a worker is asking the same question in its terminal, tells it the answer — one choice, wherever it is made.
+    Raises before anything is written when the canvas cannot take it."""
+    base = st.get("QA_CANVAS_URL", "http://127.0.0.1:4318").rstrip("/")
+    wf = st.get("QA_CANVAS_WORKFLOW", "qa-ticket-solve")
+    gate = CANVAS_GATES[signal]
+    api = f"{base}/api/workflows/{wf}"
+    try:
+        with urlopen(api, timeout=10) as r:
+            graph = json.load(r)
+    except Exception as e:
+        raise RuntimeError(f"{key}: 캔버스 실행이 맡은 티켓인데 캔버스({api})를 읽지 못했다 — 아무것도 기록하지 않았다: {e}")
+    runs = [x for x in graph.get("executions") or [] if (x.get("label") or "").startswith(f"{key} #")]
+    if not runs:
+        raise RuntimeError(f"{key}: 캔버스 워크플로 {wf} 에 이 티켓의 실행이 없다 — 아무것도 기록하지 않았다")
+    run = runs[-1]
+    url = f"{api}/executions/{run['id']}/decisions"
+    body = json.dumps({"node": gate, "outputs": ["approve"], "by": "user", "via": f"qa-driver · {by}"[:40]}).encode()
+    try:
+        with urlopen(Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST"), timeout=10):
+            pass
+    except HTTPError as e:
+        try:
+            msg = json.load(e).get("error") or ""
+        except Exception:
+            msg = ""
+        raise RuntimeError(f"{key}: 캔버스 실행 {run['label']} 의 {gate} 에 승인을 넣지 못했다 ({e.code} {msg}) — 아무것도 기록하지 않았다")
+    except Exception as e:
+        raise RuntimeError(f"{key}: 캔버스({url})에 닿지 못했다 — 아무것도 기록하지 않았다: {e}")
+    print(f"캔버스: {run['label']} {gate} → approve")
+
+
+def canvas_run_finished(st, key):
+    """The newest workflow-canvas launch for this ticket (a run-time input equal to the key) has ended — completed or
+    failed. None when the canvas cannot be read: a sweep then leaves the ticket for a later round."""
+    base = st.get("QA_CANVAS_URL", "http://127.0.0.1:4318").rstrip("/")
+    wf = st.get("QA_CANVAS_WORKFLOW", "qa-ticket-solve")
+    try:
+        with urlopen(f"{base}/api/workflows/{wf}/logs", timeout=10) as r:
+            logs = json.load(r)
+    except Exception:
+        return None
+    mine = [x for x in logs if key in (x.get("inputs") or {}).values()]
+    if not mine:
+        return True  # no canvas launch on record (manual round): nothing of the canvas runs in the worktree
+    newest = max(mine, key=lambda x: x.get("startedAt") or "")
+    return newest.get("outcome") in ("completed", "failed")
+
+
 def cmd_approve(st, a):
     st.load()
     key = a.key
     if f"{key}.md" not in st.has("ready", key) and not a.force:
         die(f"{key}: ready/{key}.md 가 없다 — 코디네이터 검토가 끝난 티켓만 승인한다 (--force 로 무시)")
+    canvas = canvas_owned(st, key)
+    if canvas:
+        canvas_decide(st, key, "approved", a.by)
     os.makedirs(st.p("approved"), exist_ok=True)
     with open(st.p("approved", f"{key}.md"), "w", encoding="utf-8") as f:
         f.write(f"# {key} 반출 승인\n\n- 시각: {now()}\n- 승인: {a.by}\n- 범위: ready/{key}.md 의 브랜치 push · PR 생성 (머지는 따로)\n")
     text = (f"[qa-driver] 사용자가 {key} 반출(push·PR)을 승인했다 — {st.p('approved', key + '.md')}. "
             f"브리프의 반출 단계를 진행하고, 끝나면 {st.p('delivered', key + '.md')} 에 PR 주소를 남겨라.")
+    if canvas:
+        log(st, f"APPROVE {key} by {a.by} (canvas)")
+        return
     tell_coordinator(st, key, text, "반출", "deliver", "approved")
     log(st, f"APPROVE {key} by {a.by}")
 
@@ -527,6 +597,9 @@ def cmd_merge(st, a):
     prs = PR_URL.findall(open(st.p("delivered", f"{key}.md"), encoding="utf-8").read())
     if not prs:
         die(f"{key}: delivered/{key}.md 에 PR 주소가 없다")
+    canvas = canvas_owned(st, key)
+    if canvas:
+        canvas_decide(st, key, "merge", a.by)
     os.makedirs(st.p("merge"), exist_ok=True)
     with open(st.p("merge", f"{key}.md"), "w", encoding="utf-8") as f:
         f.write(f"# {key} 머지 지시\n\n- 시각: {now()}\n- 지시: {a.by}\n- 대상: " + " ".join(prs) + "\n")
@@ -537,6 +610,9 @@ def cmd_merge(st, a):
             f"{st.p('blocked', key + '.md')} 에 사유를 남겨라. Jira 「개발 완료」 전이와 전달 코멘트는 PR 이 모두 머지된 뒤에만 한다"
             "(형식은 티켓 규칙 스킬대로, 머지 전에는 전이하지 않는다). "
             "워크트리 정리는 하지 않는다(PR 이 모두 머지되면 드라이버 회차가 터미널을 닫고 지운다).")
+    if canvas:
+        log(st, f"MERGE-ORDER {key} by {a.by} (canvas)")
+        return
     tell_coordinator(st, key, text, "머지", "merge", "merge")
     log(st, f"MERGE-ORDER {key} by {a.by}")
 
@@ -580,12 +656,35 @@ def merged_pr_heads(path):
     return {d["headRefOid"] for d in json.loads(r.stdout or "[]")}
 
 
+def own_changes(path):
+    """`git status` lines of this checkout, less untracked dependency links: a `node_modules` symlink that a setup step
+    or a worker pointed at another checkout's install holds no work (seen: PSQ-1114's plan/node_modules → PSQ-1112),
+    and a next-env.d.ts that Next.js only added reference lines to is generated, not work (seen: PSQ-1112)."""
+    # Not git(): its strip() would eat the leading status column of the first line (" M x" → "M x").
+    r = subprocess.run(["git", "-C", path, "status", "--porcelain", "--ignore-submodules=all"],
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        return ["git status 실패"]
+    lines = r.stdout.splitlines()
+    def link(line):
+        rel = line[3:].strip().strip('"').rstrip("/")
+        return line.startswith("?? ") and os.path.basename(rel) == "node_modules" and os.path.islink(os.path.join(path, rel))
+    def next_env(line):
+        # `next dev`/`next build` adds `/// <reference path="./.next/types/routes.d.ts" />` to a tracked next-env.d.ts.
+        if line[3:].strip() != "next-env.d.ts" or line[:2].strip() != "M":
+            return False
+        diff = git(path, "diff", "--unified=0", "--", "next-env.d.ts") or ""
+        body = [l for l in diff.splitlines() if l[:1] in "+-" and not l.startswith(("+++", "---"))]
+        return bool(body) and all(l.startswith("+/// <reference ") for l in body)
+    return [line for line in lines if line.strip() and not link(line) and not next_env(line)]
+
+
 def repo_problems(path, merged_heads=()):
     """Uncommitted changes, or a HEAD that is not merged — neither in a remote base branch nor the head of a merged
     PR (delivered/ record or gh). A pushed but unmerged branch counts: its open PR still needs the worktree. Submodule
     pointer moves in a superproject are not changes of its own (each populated submodule is checked by itself)."""
     out = []
-    if git(path, "status", "--porcelain", "--ignore-submodules=all"):
+    if own_changes(path):
         out.append(f"{path}: 커밋하지 않은 변경")
     head = git(path, "rev-parse", "HEAD")
     if head and head not in merged_heads and not merged_into_base(path, head):
@@ -630,11 +729,26 @@ def cleanup_execute(st, key, plan):
         log(st, f"UNBLOCK {key} {f} (cleaned)")
 
 
+def caller_inside(wts):
+    """The worktree of wts this process runs in: its Orca terminal's worktree (ORCA_WORKTREE_ID ends in ::<path>) or
+    the working directory. Removing it would close the caller's own terminal before it could report."""
+    here = [os.getcwd()] + [os.environ.get("ORCA_WORKTREE_ID", "").rpartition("::")[2]]
+    real = lambda p: os.path.realpath(p).rstrip("/") + "/"
+    for wt in wts:
+        if any(h and real(h).startswith(real(wt)) for h in here):
+            return wt
+    return None
+
+
 def cmd_cleanup(st, a):
     st.load()
     key, wts = a.key, ticket_worktrees(st, a.key)
     if not wts:
         die(f"{key}: 정리할 워크트리가 없다")
+    inside = caller_inside(wts)
+    if inside and not a.dry_run:
+        die(f"{key}: 지울 워크트리 안({inside})에서 불렀다 — 지우면 이 터미널도 닫힌다. 지우지 않았다. "
+            "워크트리 밖에서 다시 부르거나, workflow-canvas 플로면 선별 플로의 「끝난 티켓 정리」(qa-driver sweep)에 맡긴다", 4)
     plan, problems = cleanup_plan(wts, merged_heads(st, key))
     for wt, subs in plan:
         print(f"정리: {wt}" + (f" (deinit: {', '.join(subs)})" if subs else ""))
@@ -694,6 +808,11 @@ def finished_cleanups(st, done_keys):
         if prs and all(state == "MERGED" for state, _ in prs.values()) or not prs and no_fix_closable:
             # 드라이버 밖에서 이미 지운 워크트리는 지울 것 없이 정리 표시만 남긴다.
             plan, problems = cleanup_plan([wt] if os.path.isdir(wt) else [], {head for _, head in prs.values()})
+            # 캔버스 실행이 맡은 티켓은 그 실행이 끝난 뒤에만 지운다 — 코디네이터·워커가 그 워크트리 안에서 돌고 있다.
+            if plan and canvas_owned(st, r["key"]):
+                done = canvas_run_finished(st, r["key"])
+                if not done:
+                    problems = problems + ["캔버스 실행 진행 중" if done is False else "캔버스 실행 상태를 읽지 못함"]
             out.append((r["key"], plan, problems))
     return out
 
@@ -705,11 +824,17 @@ def sweep_finished(st, done_keys):
         t = st.ticket(key)
         if problems:
             reason = " · ".join(problems)
+            print(f"정리 보류: {key}\t{reason}")
             if t.get("cleanup_skip") != reason:
                 t["cleanup_skip"] = reason
                 st.save_ticket(t)
                 log(st, f"CLEANUP-SKIP {key}: {reason}")
             continue
+        inside = caller_inside([wt for wt, _ in plan])
+        if inside:
+            print(f"정리 보류: {key}\t이 워크트리 안에서 불렀다 — 밖에서 다시 부른다 ({inside})")
+            continue
+        print(f"정리: {key}\t{plan[0][0] if plan else '(워크트리 이미 없음 — 정리 표시만)'}")
         live = live_handles()
         for h in ticket_handles(st, key):
             if h in live:
@@ -718,7 +843,26 @@ def sweep_finished(st, done_keys):
         try:
             cleanup_execute(st, key, plan)
         except Exception as e:
+            print(f"정리 실패: {key}\t{e}")
             log(st, f"ERROR cleanup {key}: {e}")
+
+
+def cmd_sweep(st, a):
+    """The clean-up half of `run`, alone: no selection, no Jira transition. For a caller outside the ticket worktrees
+    (the workflow-canvas select flow), so removing a worktree never ends the caller's own terminal."""
+    st.load()
+    try:
+        done_keys = jira_done_keys(st)
+    except Exception as e:
+        print(f"qa-driver: Jira 완료 상태 조회 실패, PR 머지로만 정리 — {e}", file=sys.stderr)
+        done_keys = set()
+    if a.dry_run:
+        for k, plan, problems in finished_cleanups(st, done_keys):
+            where = plan[0][0] if plan else "(워크트리 이미 없음)"
+            print(f"정리 {'보류' if problems else '예정'}: {k}\t{where}" + (f"\t{' · '.join(problems)}" if problems else ""))
+        return
+    with Lock(st):
+        sweep_finished(st, done_keys)
 
 
 def ticket_handles(st, key):
@@ -872,7 +1016,7 @@ def main():
     ap = argparse.ArgumentParser(prog="qa-driver", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--home", help="state home (default $QA_DRIVER_HOME or ~/.qa-driver)")
     sp = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("init", "run", "drive", "worker", "status", "approve", "merge", "tell", "cleanup", "ignore", "restart", "close", "retire", "adopt"):
+    for name in ("init", "run", "drive", "worker", "status", "approve", "merge", "tell", "cleanup", "sweep", "ignore", "restart", "close", "retire", "adopt"):
         p = sp.add_parser(name)
         p.add_argument("parent")
         if name in ("drive", "worker", "approve", "merge", "cleanup", "ignore", "restart"):
@@ -903,6 +1047,8 @@ def main():
             p.add_argument("--by", default="사용자")
         if name == "cleanup":
             p.add_argument("--force", action="store_true")
+            p.add_argument("--dry-run", action="store_true")
+        if name == "sweep":
             p.add_argument("--dry-run", action="store_true")
         if name == "ignore":
             p.add_argument("--undo", action="store_true")
