@@ -24,6 +24,10 @@
     qa-driver adopt    <PARENT> [--check] [--set K=V]... [--automation ID]
                                                       take over an older watcher: fill missing config keys and point
                                                       its Orca automation at `qa-driver run`
+    qa-driver audit    <PROJECT_DIR> [--min N] [--json] [--no-save]
+                                                      every driver whose QA_RECORD_DIR is under that folder: 「못 한 것」
+                                                      of its done/·blocked/ reports by tag × repo, and the folder's
+                                                      rejection logs, compared with the previous audit
 
 State lives in $QA_DRIVER_HOME/<parent in lower case>/ (default ~/.qa-driver). --home <dir> points at another home,
 e.g. an older watcher's. Python 3 standard library only; needs the `orca` CLI, git, and `gh` for the merge check.
@@ -541,11 +545,71 @@ def canvas_run_finished(st, key):
     return newest.get("outcome") in ("completed", "failed")
 
 
+# ---------- verification fields of a done/ report ----------
+REPORT_FIELDS_SINCE = datetime.datetime(2026, 11, 2)  # done/ reports older than this predate the two fields
+REPORT_KEYS = ("검증한 것", "못 한 것")
+REPORT_RE = re.compile(r"^([A-Z][A-Z0-9]+-\d+)(?:-(.+))?\.md$")
+
+
+def report_fields(path):
+    """Top-level `- 이름: 값` lines of a done/ report, each with its indented `- ` items: {name: (value, [items])}."""
+    out, cur = {}, None
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        m = re.match(r"^- ([^:：]+)[:：]\s*(.*)$", line)
+        if m:
+            cur = m.group(1).strip()
+            out[cur] = (m.group(2).strip(), [])
+            continue
+        m = re.match(r"^\s+[-*] (.+)$", line)
+        if m and cur:
+            out[cur][1].append(m.group(1).strip())
+        elif not line.strip() or line.startswith(("#", "|", "```")):
+            cur = None
+    return out
+
+
+def report_problems(path):
+    """Why this report fails the verification-record gate (empty list = passes)."""
+    f = report_fields(path)
+    probs = []
+    for k in REPORT_KEYS:
+        v, items = f.get(k, ("", []))
+        if k not in f:
+            probs.append(f"`{k}` 줄 없음")
+        elif not items and (not v or v.startswith("<")):
+            probs.append(f"`{k}` 비어 있음")
+    return probs
+
+
+def gaps_of(fields):
+    """「못 한 것」 items as (tag, text). A legacy screen report's 「못 잰 것」 counts too."""
+    v, items = fields.get("못 한 것") or fields.get("못 잰 것") or ("", [])
+    raw = items or ([v] if v and v != "없음" and not v.startswith("<") else [])
+    out = []
+    for it in raw:
+        m = re.match(r"^\[([^\]]+)\]\s*(.*)$", it)
+        out.append((m.group(1).strip(), m.group(2).strip()) if m else ("미분류", it))
+    return out
+
+
 def cmd_approve(st, a):
     st.load()
     key = a.key
     if f"{key}.md" not in st.has("ready", key) and not a.force:
         die(f"{key}: ready/{key}.md 가 없다 — 코디네이터 검토가 끝난 티켓만 승인한다 (--force 로 무시)")
+    bad = []
+    for f in st.has("done", key):
+        path = st.p("done", f)
+        if datetime.datetime.fromtimestamp(os.path.getmtime(path)) < REPORT_FIELDS_SINCE:
+            continue
+        bad += [f"done/{f}: {p}" for p in report_problems(path)]
+    if bad and not a.force:
+        die(f"{key}: 검증 기록이 비었다 — 워커 보고에 `검증한 것`·`못 한 것` 을 채운 뒤 승인한다 (--force 로 무시)\n  "
+            + "\n  ".join(bad))
     canvas = canvas_owned(st, key)
     if canvas:
         canvas_decide(st, key, "approved", a.by)
@@ -1012,13 +1076,130 @@ def cmd_ignore(st, a):
     log(st, f"{'UNIGNORE' if a.undo else 'IGNORE'} {a.key}")
 
 
+def audit_reports(st):
+    """Every done/ and blocked/ report of this driver, current and archived rounds: (key, repo, path, kind)."""
+    dirs = [("done", st.p("done")), ("blocked", st.p("blocked"))]
+    rounds = st.p("rounds")
+    if os.path.isdir(rounds):
+        for key in sorted(os.listdir(rounds)):
+            for n in sorted(os.listdir(os.path.join(rounds, key))):
+                for kind in ("done", "blocked"):
+                    dirs.append((kind, os.path.join(rounds, key, n, kind)))
+    for kind, d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for f in sorted(os.listdir(d)):
+            m = REPORT_RE.match(f)
+            if m:
+                yield m.group(1), m.group(2) or "", os.path.join(d, f), kind
+
+
+def cmd_audit(a):
+    """Gather the 「못 한 것」 of every driver whose records live under one project folder, plus its rejection logs."""
+    proj = os.path.realpath(os.path.expanduser(a.parent))
+    if not os.path.isdir(proj):
+        die(f"프로젝트 폴더가 아니다: {a.parent}")
+    home = os.path.expanduser(a.home or os.environ.get("QA_DRIVER_HOME") or "~/.qa-driver")
+    parents, rows, legacy, reports = [], [], 0, 0
+    for name in sorted(os.listdir(home)) if os.path.isdir(home) else []:
+        if not os.path.isfile(os.path.join(home, name, "config.env")):
+            continue
+        st = State(name.upper(), home).load()
+        rec = os.path.realpath(st.get("QA_RECORD_DIR") or st.p("records"))
+        if rec != proj and not rec.startswith(proj + os.sep):
+            continue
+        parents.append(st.parent)
+        for key, part, path, kind in audit_reports(st):
+            reports += 1
+            if kind == "blocked":
+                lines = open(path, encoding="utf-8").read().splitlines()
+                rows.append(("막힘", "화면" if part == "screen" else part or "티켓", key, (lines[2] if len(lines) > 2 else "").strip()))
+                continue
+            f = report_fields(path)
+            if "검증한 것" not in f:
+                legacy += 1
+            repo = "화면" if part == "screen" else (f.get("저장소", ("", []))[0] or part)
+            rows += [(tag, repo, key, text) for tag, text in gaps_of(f)]
+    logs = {}
+    for root, dnames, fnames in os.walk(proj):
+        dnames[:] = [d for d in dnames if not d.startswith(".")]
+        for fn in fnames:
+            if fn.endswith(".md") and "기각 로그" in fn:
+                p = os.path.join(root, fn)
+                logs[os.path.relpath(p, proj)] = int(os.path.getmtime(p))
+
+    groups = {}
+    for tag, repo, key, text in rows:
+        groups.setdefault((tag, repo), []).append((key, text))
+    counts = {f"{t}\t{r}": len(v) for (t, r), v in groups.items()}
+    snap_path = os.path.join(home, "audit", re.sub(r"[^\w.-]+", "_", proj.strip(os.sep)) + ".json")
+    try:
+        prev = json.load(open(snap_path, encoding="utf-8"))
+    except (OSError, ValueError):
+        prev = {}
+    pc, pl = prev.get("counts", {}), prev.get("rejection_logs", {})
+
+    def delta(k):
+        if not prev:
+            return "첫 집계"
+        d = counts.get(k, 0) - pc.get(k, 0)
+        return "새로 나옴" if k not in pc else (f"+{d}" if d > 0 else str(d) if d else "=")
+
+    if a.json:
+        print(json.dumps({"project": proj, "parents": parents, "reports": reports, "legacy": legacy,
+                          "gaps": [dict(tag=t, repo=r, key=k, text=x) for t, r, k, x in rows],
+                          "counts": counts, "previous": pc, "rejection_logs": logs, "previous_logs": pl},
+                         ensure_ascii=False, indent=1))
+    else:
+        out = [f"# 검증 공백 집계 — {os.path.basename(proj)}", "",
+               f"- 시각: {now()} (직전: {prev.get('at', '없음')})",
+               f"- 드라이버: {', '.join(parents) or '없음 — QA_RECORD_DIR 가 이 폴더를 가리키는 드라이버가 없다'}",
+               f"- 보고: {reports}건 (두 칸 이전 형식 {legacy}건 — 「못 한 것」 을 놓쳤을 수 있다)", "",
+               "## 못 한 검증 (꼬리표 × 저장소)", ""]
+        if groups:
+            out += ["| 꼬리표 | 저장소 | 건수 | 직전 대비 | 티켓 |", "| --- | --- | --- | --- | --- |"]
+            for (t, r), v in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+                out.append(f"| {t} | {r} | {len(v)} | {delta(t + chr(9) + r)} | {', '.join(sorted({k for k, _ in v}))} |")
+        else:
+            out.append("없음")
+        gone = [k.replace("\t", " · ") for k in pc if k not in counts]
+        if gone:
+            out += ["", f"- 직전에 있다 사라진 것: {', '.join(gone)}"]
+        out += ["", f"## 하네스 개선 후보 (서로 다른 티켓 {a.min}개 이상)", ""]
+        cands = [(tr, v) for tr, v in groups.items() if len({k for k, _ in v}) >= a.min]
+        for (t, r), v in sorted(cands, key=lambda kv: -len(kv[1])):
+            out.append(f"### [{t}] {r} — {len(v)}건")
+            out += [f"- {k}: {x}" for k, x in v]
+            out.append("")
+        if not cands:
+            out += ["없음", ""]
+        out += ["## 리뷰 기각 로그", ""]
+        if logs:
+            out += ["| 노트 | 수정 시각 | 직전 이후 |", "| --- | --- | --- |"]
+            for p, mt in sorted(logs.items(), key=lambda kv: -kv[1]):
+                ch = "첫 집계" if not prev else ("새 노트" if p not in pl else ("바뀜" if mt != pl[p] else "="))
+                out.append(f"| {p} | {datetime.datetime.fromtimestamp(mt):%Y-%m-%d %H:%M} | {ch} |")
+        else:
+            out.append("없음")
+        out += ["", "> 후보마다 고칠 스킬·도구의 가설과, 기각 사유의 유형 분류·리뷰어 브리프 수정 제안은 이 집계를 읽는 에이전트가 쓴다. 브리프 수정은 사람이 판정한다."]
+        print("\n".join(out))
+    if not a.no_save:
+        os.makedirs(os.path.dirname(snap_path), exist_ok=True)
+        with open(snap_path, "w", encoding="utf-8") as f:
+            json.dump({"at": now(), "counts": counts, "rejection_logs": logs}, f, ensure_ascii=False, indent=1)
+
+
 def main():
     ap = argparse.ArgumentParser(prog="qa-driver", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--home", help="state home (default $QA_DRIVER_HOME or ~/.qa-driver)")
     sp = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("init", "run", "drive", "worker", "status", "approve", "merge", "tell", "cleanup", "sweep", "ignore", "restart", "close", "retire", "adopt"):
+    for name in ("init", "run", "drive", "worker", "status", "approve", "merge", "tell", "cleanup", "sweep", "ignore", "restart", "close", "retire", "adopt", "audit"):
         p = sp.add_parser(name)
-        p.add_argument("parent")
+        p.add_argument("parent", help="project folder" if name == "audit" else None)
+        if name == "audit":
+            p.add_argument("--min", type=int, default=3, help="distinct tickets for a harness-fix candidate")
+            p.add_argument("--json", action="store_true")
+            p.add_argument("--no-save", action="store_true", help="do not move the comparison snapshot forward")
         if name in ("drive", "worker", "approve", "merge", "cleanup", "ignore", "restart"):
             p.add_argument("key")
         if name == "close":
@@ -1063,6 +1244,8 @@ def main():
     for k in ([a.key] if getattr(a, "key", None) else []) + (getattr(a, "keys", None) or []):
         if not re.fullmatch(r"[A-Z][A-Z0-9]+-\d+", k):
             die(f"티켓 키 형식이 아니다: {k}")
+    if a.cmd == "audit":
+        return cmd_audit(a)
     st = State(a.parent.upper(), a.home)
     try:
         globals()["cmd_" + a.cmd](st, a)
