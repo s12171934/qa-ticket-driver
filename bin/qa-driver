@@ -607,17 +607,18 @@ def cmd_approve(st, a):
         if datetime.datetime.fromtimestamp(os.path.getmtime(path)) < REPORT_FIELDS_SINCE:
             continue
         bad += [f"done/{f}: {p}" for p in report_problems(path)]
-    if bad and not a.force:
-        die(f"{key}: 검증 기록이 비었다 — 워커 보고에 `검증한 것`·`못 한 것` 을 채운 뒤 승인한다 (--force 로 무시)\n  "
-            + "\n  ".join(bad))
+    if bad:  # approve is always the user's call (terminal or dashboard): report the gaps, never refuse over them
+        print(f"경고: {key} 검증 기록 공백 — 사용자 승인으로 통과시키고 approved/{key}.md 에 남긴다\n  " + "\n  ".join(bad))
     canvas = canvas_owned(st, key)
     if canvas:
         canvas_decide(st, key, "approved", a.by)
     os.makedirs(st.p("approved"), exist_ok=True)
     with open(st.p("approved", f"{key}.md"), "w", encoding="utf-8") as f:
-        f.write(f"# {key} 반출 승인\n\n- 시각: {now()}\n- 승인: {a.by}\n- 범위: ready/{key}.md 의 브랜치 push · PR 생성 (머지는 따로)\n")
+        f.write(f"# {key} 반출 승인\n\n- 시각: {now()}\n- 승인: {a.by}\n- 범위: ready/{key}.md 의 브랜치 push · PR 생성 (머지는 따로)\n"
+                + (f"- 검증 기록 공백(사용자 승인으로 통과):\n" + "".join(f"  - {b}\n" for b in bad) if bad else ""))
     text = (f"[qa-driver] 사용자가 {key} 반출(push·PR)을 승인했다 — {st.p('approved', key + '.md')}. "
-            f"브리프의 반출 단계를 진행하고, 끝나면 {st.p('delivered', key + '.md')} 에 PR 주소를 남겨라.")
+            f"브리프의 반출 단계를 진행하고, 끝나면 {st.p('delivered', key + '.md')} 에 PR 주소를 남겨라."
+            + (" 워커 보고의 검증 기록 공백이 approved 파일에 있다 — PR 본문 「남은 확인」에 함께 적어라." if bad else ""))
     if canvas:
         log(st, f"APPROVE {key} by {a.by} (canvas)")
         return
