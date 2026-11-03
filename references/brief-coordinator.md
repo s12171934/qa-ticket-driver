@@ -17,7 +17,7 @@
 - 이 흐름의 상태 계약: `qa-ticket-driver` 스킬의 `exports/state-contract.md`
 
 ## 1단계 — 문제 특정
-1. **티켓 조회** — 설명·댓글·첨부를 직접 본다. 인증: `JIRA_EMAIL=@@JIRA_EMAIL@@` + `ATLASSIAN_API_TOKEN` (없으면 @@TOKEN_HINT@@). 사이트 `@@JIRA_SITE@@`.
+1. **티켓 조회** — 설명·댓글·첨부를 직접 본다. Jira REST 는 모두 `@@DRIVER@@ @@HOME_OPT@@ jira @@PARENT_KEY@@ <경로>` 로 부른다(사이트 `@@JIRA_SITE@@`, 계정·토큰은 드라이버가 채운다). 예: `… jira … "/rest/api/3/issue/@@KEY@@?fields=summary,status,description,comment,attachment"`, 첨부는 `… jira … <첨부 content URL> --out <파일>`, 전이·코멘트는 `--data '<JSON>'`(또는 `--data -` 로 stdin). **명령에 계정 이메일·토큰을 직접 쓰지 않는다** — `curl -u` 로 이메일을 넣으면 privacy 훅이 bypass 모드에서도 권한 확인을 띄워 멈춘다. 티켓 규칙 스킬이 curl 예시를 들어도 호출은 이 명령으로 바꿔 한다.
 2. **소유 저장소 확정** — 어느 저장소(서브모듈)가 이 동작을 소유하는지 **코드로** 확인한다. 티켓 문구로 추측하지 않는다.
    필요한 서브모듈만 이 워크트리에서 채운다: `git submodule update --init --reference "@@REPO@@/<sub>" -- <sub>` 뒤 `git -C <sub> fetch origin`.
    (`@@REPO@@/<sub>` 가 없으면 `--reference` 를 뺀다. 빈 서브모듈 디렉터리에서 `git -C <sub>` 는 부모 저장소로 샌다 — 채운 뒤에만 쓴다.)

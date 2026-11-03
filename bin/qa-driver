@@ -16,6 +16,9 @@
     qa-driver cleanup  <PARENT> <KEY> [--force|--dry-run]  deinit submodules and remove the ticket worktree
     qa-driver sweep    <PARENT> [--dry-run]           only the clean-up of a round: remove the worktrees of finished
                                                       tickets (run from outside them — the workflow-canvas select flow)
+    qa-driver jira     <PARENT> <PATH|URL> [-X METHOD] [--data JSON|-] [--out FILE]
+                                                      one Jira REST call with the driver's account and token, so an
+                                                      agent's command line never holds the email or the token
     qa-driver ignore   <PARENT> <KEY> [--undo]        keep a ticket out of selection
     qa-driver restart  <PARENT> <KEY> [--force]       start the ticket's coordinator again with its existing brief
     qa-driver close    <PARENT> <KEY>...              close the tickets' live coordinator / worker terminals
@@ -192,10 +195,57 @@ def jira_token(st):
     return t
 
 
+def jira_auth(st):
+    return base64.b64encode(f'{st.get("JIRA_EMAIL")}:{jira_token(st)}'.encode()).decode()
+
+
+def jira_site(st):
+    return st.get("JIRA_SITE").removeprefix("https://").rstrip("/")
+
+
+def cmd_jira(st, a):
+    """One REST call on the driver's site. The account email and token come from config.env and the keychain,
+    so they never appear in the caller's command line (a privacy hook asks for confirmation when they do)."""
+    st.load(need=("JIRA_SITE", "JIRA_EMAIL"))
+    site, target = jira_site(st), a.path
+    if re.match(r"https?://", target):
+        if not re.match(rf"https://{re.escape(site)}(/|$)", target):
+            die(f"이 드라이버의 Jira 사이트({site}) 주소가 아니다: {target}")
+        url = target
+    else:
+        url = f"https://{site}/{target.lstrip('/')}"
+    data = a.data
+    if data == "-":
+        data = sys.stdin.read()
+    if data is not None:
+        try:
+            json.loads(data)
+        except ValueError as e:
+            die(f"--data 가 JSON 이 아니다: {e}")
+    method = (a.method or ("POST" if data is not None else "GET")).upper()
+    req = Request(url, data=data.encode() if data is not None else None, method=method,
+                  headers={"Authorization": "Basic " + jira_auth(st), "Accept": "application/json",
+                           **({"Content-Type": "application/json"} if data is not None else {})})
+    try:
+        with urlopen(req, timeout=60) as r:
+            body, status = r.read(), r.status
+    except HTTPError as e:
+        sys.stderr.write(f"HTTP {e.code} {method} {url}\n{e.read().decode(errors='replace')[:2000]}\n")
+        sys.exit(1)
+    if a.out:
+        with open(a.out, "wb") as f:
+            f.write(body)
+        print(f"{status} {len(body)} bytes → {a.out}")
+    else:
+        sys.stdout.write(body.decode(errors="replace"))
+        if body and not body.endswith(b"\n"):
+            sys.stdout.write("\n")
+
+
 def jira_search(st, jql, fields, expand=None):
     """Every issue the JQL matches, across pages."""
-    auth = base64.b64encode(f'{st.get("JIRA_EMAIL")}:{jira_token(st)}'.encode()).decode()
-    site = st.get("JIRA_SITE").removeprefix("https://").rstrip("/")
+    auth = jira_auth(st)
+    site = jira_site(st)
     out, nxt = [], None
     while True:
         q = {"jql": jql, "fields": fields, "maxResults": "100"}
@@ -1194,7 +1244,7 @@ def main():
     ap = argparse.ArgumentParser(prog="qa-driver", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--home", help="state home (default $QA_DRIVER_HOME or ~/.qa-driver)")
     sp = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("init", "run", "drive", "worker", "status", "approve", "merge", "tell", "cleanup", "sweep", "ignore", "restart", "close", "retire", "adopt", "audit"):
+    for name in ("init", "run", "drive", "worker", "status", "approve", "merge", "tell", "jira", "cleanup", "sweep", "ignore", "restart", "close", "retire", "adopt", "audit"):
         p = sp.add_parser(name)
         p.add_argument("parent", help="project folder" if name == "audit" else None)
         if name == "audit":
@@ -1234,6 +1284,11 @@ def main():
             p.add_argument("--dry-run", action="store_true")
         if name == "ignore":
             p.add_argument("--undo", action="store_true")
+        if name == "jira":
+            p.add_argument("path", help="REST path (/rest/api/3/...) or a full URL on the driver's site")
+            p.add_argument("-X", "--method", help="default GET, or POST with --data")
+            p.add_argument("--data", help="JSON request body; - reads stdin")
+            p.add_argument("--out", help="write the response body to this file (attachments)")
         if name == "tell":
             p.add_argument("--to", required=True, help="receiver's terminal handle (term_...)")
             p.add_argument("--type", default="status", choices=TELL_TYPES)
