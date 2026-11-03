@@ -27,6 +27,14 @@
 ## 정리
 끝나면 네가 띄운 서버를 멈추고 네가 연 탭을 닫는다. 닫지 못한 것은 결과의 「남은 것」에 적는다.
 
+- **Aside 탭은 `aside repl`·`aside exec` 로 닫히지 않는다**(`closeTab`·`page.close()` 가 연결만 끊거나 AbortError). 브라우저 탭 하나가 렌더러 프로세스 하나라, 남긴 탭이 쌓이면 Aside 가 스왑을 수 GB 씩 차지한다. 서버를 멈추기 **전에** JXA 로 닫는다 — 앱을 활성화하지 않으므로 사용자 포커스를 건드리지 않는다. `<포트>` 는 네가 띄운 개발 서버 포트이고, 다른 출처는 너 혼자 연 것이 확실할 때만 넣는다:
+
+  ```sh
+  osascript -l JavaScript -e 'const re=/^https?:\/\/(localhost|127\.0\.0\.1):<포트>\//;let n=0;Application("Aside").windows().forEach(w=>w.tabs().slice().reverse().forEach(t=>{if(re.test(t.url())){t.close();n++}}));n+" closed"'
+  ```
+
+- 닫은 개수를 결과에 적는다. 0 인데 탭을 열었다면 정규식을 다시 확인한다.
+
 ## 끝 신호 — 코디네이터가 읽는다
 `@@STATE_DIR@@/done/<티켓키>-screen.md`:
 
