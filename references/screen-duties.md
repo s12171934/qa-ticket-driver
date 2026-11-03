@@ -11,6 +11,7 @@
 
 ## 환경
 - 이 워크트리의 현재 브랜치(임시 핀 포함)로 화면을 띄운다. 이미 떠 있는 다른 워크트리의 서버를 빌려 쓰면 그 사실(포트·워크트리)을 결과에 적는다.
+- **개발 서버는 브라우저 자동 열기를 끄고 띄운다.** 기본 브라우저가 Aside 라, 자동 열기가 켜진 서버(plang `web/webpack.config.js` 의 `devServer.open: true` 등)는 띄울 때마다 사용자 창에 탭을 하나 남긴다. 그런 탭이 하루에 수십 개 쌓여 Aside 가 스왑을 10GB 넘게 차지한 적이 있다. webpack-dev-server 는 `--no-open`(예: `npm run start-react-dev -- --port <포트> --no-open`), Vite 는 `--open false`, Storybook 은 `--no-open`, CRA 계열은 `BROWSER=none` 을 붙인다. 화면은 녹화 스킬이 여는 탭에서만 본다.
 - 로그인은 인계 브리프의 계정으로 한다. 이미 로그인된 세션을 썼으면 **실제 계정·기관**을 화면에서 읽어 적는다 — 지정 계정과 다르거나 확인하지 못했으면 그렇게 쓴다.
 
 ## 실측 계약
@@ -27,7 +28,7 @@
 ## 정리
 끝나면 네가 띄운 서버를 멈추고 네가 연 탭을 닫는다. 닫지 못한 것은 결과의 「남은 것」에 적는다.
 
-- **Aside 탭은 `aside repl`·`aside exec` 로 닫히지 않는다**(`closeTab`·`page.close()` 가 연결만 끊거나 AbortError). 브라우저 탭 하나가 렌더러 프로세스 하나라, 남긴 탭이 쌓이면 Aside 가 스왑을 수 GB 씩 차지한다. 서버를 멈추기 **전에** JXA 로 닫는다 — 앱을 활성화하지 않으므로 사용자 포커스를 건드리지 않는다. `<포트>` 는 네가 띄운 개발 서버 포트이고, 다른 출처는 너 혼자 연 것이 확실할 때만 넣는다:
+- `aside repl` 이 `openTab` 으로 연 탭은 repl 이 끝날 때 함께 닫힌다. 하지만 그 밖의 경로로 생긴 탭(서버 자동 열기, `open <URL>`, 사용자 창의 기존 탭)은 `closeTab`·`page.close()` 로 닫히지 않는다(연결만 끊기거나 AbortError). 브라우저 탭 하나가 렌더러 프로세스 하나라, 남은 탭이 쌓이면 Aside 가 스왑을 수 GB 씩 차지한다. 서버를 멈추기 **전에** 네 포트의 탭을 JXA 로 닫는다 — 앱을 활성화하지 않으므로 사용자 포커스를 건드리지 않는다. `<포트>` 는 네가 띄운 개발 서버 포트이고, 다른 출처는 너 혼자 연 것이 확실할 때만 넣는다:
 
   ```sh
   osascript -l JavaScript -e 'const re=/^https?:\/\/(localhost|127\.0\.0\.1):<포트>\//;let n=0;Application("Aside").windows().forEach(w=>w.tabs().slice().reverse().forEach(t=>{if(re.test(t.url())){t.close();n++}}));n+" closed"'
