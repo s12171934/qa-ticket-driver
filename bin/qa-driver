@@ -548,7 +548,9 @@ def canvas_owned(st, key):
 def canvas_decide(st, key, signal, by):
     """Approve the canvas run's gate for this signal, as the user. The run's coordinator takes it from there and,
     when a worker is asking the same question in its terminal, tells it the answer — one choice, wherever it is made.
-    Raises before anything is written when the canvas cannot take it."""
+    Returns False when the run already decided that gate (e.g. a held merge was rejected and a terminal session carried
+    the round on): the canvas no longer owns this signal, so the caller hands it to the coordinator terminal instead.
+    Raises before anything is written when the canvas cannot be read or reached."""
     base = st.get("QA_CANVAS_URL", "http://127.0.0.1:4318").rstrip("/")
     wf = st.get("QA_CANVAS_WORKFLOW", "qa-ticket-solve")
     gate = CANVAS_GATES[signal]
@@ -562,6 +564,10 @@ def canvas_decide(st, key, signal, by):
     if not runs:
         raise RuntimeError(f"{key}: 캔버스 워크플로 {wf} 에 이 티켓의 실행이 없다 — 아무것도 기록하지 않았다")
     run = runs[-1]
+    decided = (run.get("decisions") or {}).get(gate)
+    if decided:
+        print(f"캔버스: {run['label']} {gate} 는 이미 {'/'.join(decided)} 로 결정됨 — 코디네이터 터미널로 넘긴다")
+        return False
     url = f"{api}/executions/{run['id']}/decisions"
     body = json.dumps({"node": gate, "outputs": ["approve"], "by": "user", "via": f"qa-driver · {by}"[:40]}).encode()
     try:
@@ -576,6 +582,7 @@ def canvas_decide(st, key, signal, by):
     except Exception as e:
         raise RuntimeError(f"{key}: 캔버스({url})에 닿지 못했다 — 아무것도 기록하지 않았다: {e}")
     print(f"캔버스: {run['label']} {gate} → approve")
+    return True
 
 
 def canvas_run_finished(st, key):
@@ -659,9 +666,7 @@ def cmd_approve(st, a):
         bad += [f"done/{f}: {p}" for p in report_problems(path)]
     if bad:  # approve is always the user's call (terminal or dashboard): report the gaps, never refuse over them
         print(f"경고: {key} 검증 기록 공백 — 사용자 승인으로 통과시키고 approved/{key}.md 에 남긴다\n  " + "\n  ".join(bad))
-    canvas = canvas_owned(st, key)
-    if canvas:
-        canvas_decide(st, key, "approved", a.by)
+    canvas = canvas_owned(st, key) and canvas_decide(st, key, "approved", a.by)
     os.makedirs(st.p("approved"), exist_ok=True)
     with open(st.p("approved", f"{key}.md"), "w", encoding="utf-8") as f:
         f.write(f"# {key} 반출 승인\n\n- 시각: {now()}\n- 승인: {a.by}\n- 범위: ready/{key}.md 의 브랜치 push · PR 생성 (머지는 따로)\n"
@@ -679,7 +684,8 @@ def cmd_approve(st, a):
 def tell_coordinator(st, key, text, title, purpose, signal):
     """Send text to the ticket's live coordinator, or start one with its brief in the ticket worktree."""
     t, cl = st.ticket(key), st.claims(key)
-    handle = (t.get("coordinator") or {}).get("handle") or (cl[-1][2] if cl and len(cl[-1]) > 2 else None)
+    # A canvas claim records its launcher as "canvas-<flow>:<handle>"; the terminal handle is what follows the colon.
+    handle = (t.get("coordinator") or {}).get("handle") or (cl[-1][2].rpartition(":")[2] if cl and len(cl[-1]) > 2 else None)
     if handle and handle in live_handles():
         tell(st, handle, text, "dispatch", f"{key} {title}", key)
         print(f"전달: {handle}")
@@ -712,9 +718,7 @@ def cmd_merge(st, a):
     prs = PR_URL.findall(open(st.p("delivered", f"{key}.md"), encoding="utf-8").read())
     if not prs:
         die(f"{key}: delivered/{key}.md 에 PR 주소가 없다")
-    canvas = canvas_owned(st, key)
-    if canvas:
-        canvas_decide(st, key, "merge", a.by)
+    canvas = canvas_owned(st, key) and canvas_decide(st, key, "merge", a.by)
     os.makedirs(st.p("merge"), exist_ok=True)
     with open(st.p("merge", f"{key}.md"), "w", encoding="utf-8") as f:
         f.write(f"# {key} 머지 지시\n\n- 시각: {now()}\n- 지시: {a.by}\n- 대상: " + " ".join(prs) + "\n")
