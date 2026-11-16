@@ -22,8 +22,9 @@
     qa-driver ignore   <PARENT> <KEY> [--undo]        keep a ticket out of selection
     qa-driver restart  <PARENT> <KEY> [--force]       start the ticket's coordinator again with its existing brief
     qa-driver close    <PARENT> <KEY>...              close the tickets' live coordinator / worker terminals
-    qa-driver retire   <PARENT> [--dry-run|--force]   end of QA: disable its automations, close the shared
-                                                      coordination worktree's terminals and remove that worktree
+    qa-driver retire   <PARENT> [--dry-run|--force]   end of the whole QA, only on the user's explicit order: disable its
+                                                      automations, close the terminals of the epic worktree and the
+                                                      shared coordination worktree and remove both
     qa-driver adopt    <PARENT> [--check] [--set K=V]... [--automation ID]
                                                       take over an older watcher: fill missing config keys and point
                                                       its Orca automation at `qa-driver run`
@@ -1084,17 +1085,34 @@ def cmd_retire(st, a):
     open_ = [r["key"] for r in status_rows(st) if r["stage"] in ACTIVE and not r["ignored"]]
     coord = st.get("QA_COORD_WORKTREE")
     coord = coord if coord and os.path.isdir(coord) else None
-    terms = []
+    epic = None  # only the driver's own epic worktree (epic.json), never a QA_PARENT_WORKTREE the user supplied
     try:
-        terms = [x["handle"] for x in orca("terminal", "list").get("terminals") or []
-                 if x.get("connected") and coord and (x.get("worktreePath") or "").rstrip("/") == coord.rstrip("/")]
+        with open(st.p("epic.json"), encoding="utf-8") as f:
+            epic = json.load(f).get("path")
+    except (OSError, ValueError):
+        pass
+    epic = epic if epic and os.path.isdir(epic) and not st.get("QA_PARENT_WORKTREE") else None
+    removals = [w for w in (coord, epic) if w]
+    terms = {w: [] for w in removals}
+    try:
+        for x in orca("terminal", "list").get("terminals") or []:
+            for w in removals:
+                if x.get("connected") and (x.get("worktreePath") or "").rstrip("/") == w.rstrip("/"):
+                    terms[w].append(x["handle"])
     except Exception:
         pass
     problems = []
-    if coord:
-        problems += repo_problems_root(coord)
+    for w in removals:
+        problems += repo_problems_root(w)
+    children = []
+    if epic:
+        children = [k for k in sorted(f[:-5] for f in os.listdir(st.p("tickets")) if f.endswith(".json"))
+                    if os.path.isdir((st.ticket(k).get("worktree") or {}).get("path") or "")] if os.path.isdir(st.p("tickets")) else []
+        if children:
+            problems.append(f"에픽 워크트리 아래 남은 티켓 워크트리 {len(children)}개({', '.join(children)})")
     print(f"자동화 끄기: {', '.join(x.get('name') or x['id'] for x in autos) or '없음'}")
-    print(f"조정 워크트리: {coord or '없음'}" + (f" (열린 터미널 {len(terms)}개를 닫고 지움)" if coord else ""))
+    print(f"조정 워크트리: {coord or '없음'}" + (f" (열린 터미널 {len(terms[coord])}개를 닫고 지움)" if coord else ""))
+    print(f"에픽 워크트리: {epic or '없음'}" + (f" (열린 터미널 {len(terms[epic])}개를 닫고 지움)" if epic else ""))
     if open_:
         print(f"아직 검토 전인 티켓: {', '.join(open_)}")
     if (open_ or problems) and not a.force:
@@ -1104,18 +1122,20 @@ def cmd_retire(st, a):
     for x in autos:
         orca("automations", "edit", x["id"], "--disabled", timeout=30)
         log(st, f"RETIRE automation off {x['id']}")
-    for h in terms:
-        try:
-            orca("terminal", "close", "--terminal", h, timeout=60)
-        except Exception as e:
-            print(f"터미널 {h} 닫기 실패 — {e}", file=sys.stderr)
-    if coord:
-        for line in (git(coord, "config", "--file", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$") or "").splitlines():
+    for w in removals:
+        for h in terms[w]:
+            try:
+                orca("terminal", "close", "--terminal", h, timeout=60)
+            except Exception as e:
+                print(f"터미널 {h} 닫기 실패 — {e}", file=sys.stderr)
+        for line in (git(w, "config", "--file", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$") or "").splitlines():
             sub = line.split()[-1]
-            if os.path.exists(os.path.join(coord, sub, ".git")):
-                subprocess.run(["git", "-C", coord, "submodule", "deinit", "-f", "--", sub], capture_output=True, timeout=120)
-        orca("worktree", "rm", "--worktree", f"path:{coord}", "--force", timeout=300)
-        log(st, f"RETIRE removed {coord}")
+            if os.path.exists(os.path.join(w, sub, ".git")):
+                subprocess.run(["git", "-C", w, "submodule", "deinit", "-f", "--", sub], capture_output=True, timeout=120)
+        orca("worktree", "rm", "--worktree", f"path:{w}", "--force", timeout=300)
+        log(st, f"RETIRE removed {w}")
+    if epic:
+        os.remove(st.p("epic.json"))
     with open(st.p("retired"), "w", encoding="utf-8") as f:
         f.write(now() + "\n")
 
