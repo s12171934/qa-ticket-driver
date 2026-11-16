@@ -99,5 +99,6 @@
 - 워커가 도는 동안 이 워크트리에서 checkout·편집
 - 화면 실측을 직접 하기 — 실측 워커에게 맡긴다
 - 다른 티켓의 기록·신호 파일 수정, 확신 없는 단정(모르는 것은 `## 미확인 사항`)
+- jest 를 `node -e "require(…jest-cli).run()"` 로 띄우기 — `-e` 코드가 `process.execArgv` 에 남아 jest-worker 가 fork 하는 워커마다 jest 를 다시 실행하므로 프로세스가 기하급수로 늘어난다(2026-11-16 4,298개 → 스왑 소진·재부팅). 다른 저장소의 jest-cli 가 필요하면 `scratch/<KEY>/` 에 `require(…).run()` 한 줄짜리 .js 파일을 쓰고 `node <파일>` 로 부르거나 `node <node_modules>/jest/bin/jest.js` 를 쓴다.
 - 검증용 임시 파일을 저장소에 두기 — `@@STATE_DIR@@/scratch/@@KEY@@/` 를 쓴다
 - 파싱이 안 되는 Bash — 따옴표 없는 heredoc(`<<EOF`)·겹친 `$( )`·수천 자 스크립트는 bypass 모드에서도 권한 요청으로 멈추고 약 2분 뒤 자동 차단된다. 긴 본문·스크립트는 Write 도구로 파일에 쓰고 `bash <파일>`·`--body - < <파일>` 로 넘기며, heredoc 은 `<<'EOF'` 로 쓴다

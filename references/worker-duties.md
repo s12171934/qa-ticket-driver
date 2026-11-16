@@ -13,6 +13,7 @@
 ## 검증 계약
 - 검증하려고 개발 서버를 띄우면 브라우저 자동 열기를 끈다(webpack-dev-server `--no-open`, Vite `--open false`, Storybook `--no-open`). 기본 브라우저가 Aside 라 켜 두면 사용자 창에 탭이 쌓인다. 끝나면 띄운 서버를 멈춘다.
 - **선언이 아니라 결과를 잰다.** 조건이 실제로 성립하게 만들고 좌표·크기·상태를 측정한다.
+- jest 를 `node -e "require(…jest-cli).run()"` 로 띄우지 않는다. `-e` 코드가 `process.execArgv` 에 남아 jest-worker 가 fork 하는 워커마다 jest 를 다시 실행하므로 프로세스가 기하급수로 늘어난다(2026-11-16 4,298개 → 스왑 소진·재부팅). 다른 저장소의 jest-cli 가 필요하면 `scratch/<KEY>/` 에 `require(…).run()` 한 줄짜리 .js 파일을 쓰고 `node <파일>` 로 부르거나 `node <node_modules>/jest/bin/jest.js` 를 쓴다..
 - **red 확인 필수.** 새 단정이 수정 전 코드에서 실제로 실패하는지 확인하고 그 실패 메시지를 남긴다.
 
 ## 커밋까지만
