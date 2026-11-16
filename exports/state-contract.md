@@ -18,6 +18,7 @@ source: ai
 | --- | --- | --- |
 | `config.env` · `context.md` | 사람 | 설정 · 기능 맥락 |
 | `claimed/<KEY>` | 드라이버 | 기동마다 한 줄 `시각 \t epoch \t 코디네이터 터미널 \t 제목`. 줄 수 = 회차 |
+| `epic.json` | 드라이버 | `{path, at}` — 티켓 워크트리들의 부모인 에픽 워크트리(`QA_PARENT_WORKTREE` 를 두면 쓰지 않는다) |
 | `tickets/<KEY>.json` | 드라이버 | `{key, parent, summary, round, worktree{path,id,created_at}, coordinator{handle,at,round}, workers{<이름>: {handle, submodule, at}}, updated_at}` |
 | `briefs/<KEY>.md` | 드라이버 | 렌더된 코디네이터 브리프 |
 | `handoffs/<KEY>-<이름>.md` | 코디네이터 | 서브모듈별 인계 브리프. 있으면 그 워커가 기동됐다. `<KEY>-screen.md` 는 화면 실측 인계 |

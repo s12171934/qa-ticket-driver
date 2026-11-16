@@ -412,6 +412,37 @@ def cmd_init(st, a):
     print(st.dir)
 
 
+def epic_worktree(st):
+    """The epic worktree every ticket worktree hangs under: QA_PARENT_WORKTREE, else an Orca worktree named <PARENT>, created on first use."""
+    if st.get("QA_PARENT_WORKTREE"):
+        return st.get("QA_PARENT_WORKTREE")
+    try:
+        with open(st.p("epic.json"), encoding="utf-8") as f:
+            wt = json.load(f).get("path")
+        if wt and os.path.isdir(wt):
+            return wt
+    except (OSError, ValueError):
+        pass
+    def common_dir(path):
+        d = git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        return os.path.realpath(d) if d else None
+    common = common_dir(st.get("QA_REPO"))
+    wt = next((w["path"] for w in orca("worktree", "list").get("worktrees") or []
+               if common and w.get("displayName") == st.parent and os.path.isdir(w.get("path") or "")
+               and common_dir(w["path"]) == common), None)
+    if not wt:
+        res = orca("worktree", "create", "--repo", f'path:{st.get("QA_REPO")}', "--name", st.parent,
+                   "--comment", f"QA 에픽 {st.parent} · 하위 티켓 워크트리의 부모", "--reference", st.parent,
+                   "--no-parent", "--setup", "skip", timeout=300)
+        wt = find(res, "path")
+        if not wt or not os.path.isdir(wt):
+            raise RuntimeError("에픽 워크트리 경로 없음: " + json.dumps(res)[:300])
+        log(st, f"EPIC-WORKTREE created {wt}")
+    with open(st.p("epic.json"), "w", encoding="utf-8") as f:
+        json.dump({"path": wt, "at": now()}, f, ensure_ascii=False)
+    return wt
+
+
 def drive(st, key, status="", summary="", reopen=False):
     t = st.ticket(key)
     t.update(key=key, parent=st.parent, driver=True)
@@ -428,7 +459,7 @@ def drive(st, key, status="", summary="", reopen=False):
     if not (wt and os.path.isdir(wt)):
         args = ["worktree", "create", "--repo", f'path:{st.get("QA_REPO")}', "--name", key,
                 "--comment", f"QA {st.parent} · {t.get('summary', '')}"[:200]]
-        args += ["--parent-worktree", f'path:{st.get("QA_PARENT_WORKTREE")}'] if st.get("QA_PARENT_WORKTREE") else ["--no-parent"]
+        args += ["--parent-worktree", f"path:{epic_worktree(st)}"]
         if st.get("QA_BASE_BRANCH"):
             args += ["--base-branch", st.get("QA_BASE_BRANCH")]
         if st.get("QA_WORKTREE_SETUP"):
@@ -440,6 +471,15 @@ def drive(st, key, status="", summary="", reopen=False):
         t["worktree"] = {"path": wt, "id": find(res, "id"), "created_at": now()}
         st.save_ticket(t)
         log(st, f"WORKTREE {key} {wt}")
+    else:  # a worktree from before the epic layout: move it under the epic worktree
+        epic = epic_worktree(st)
+        try:
+            info = orca("worktree", "show", "--worktree", f"path:{wt}")
+            if os.path.realpath((find(info, "parentWorktreeId") or "::").split("::")[-1] or "/") != os.path.realpath(epic):
+                orca("worktree", "set", "--worktree", f"path:{wt}", "--parent-worktree", f"path:{epic}")
+                log(st, f"WORKTREE {key} reparented under {epic}")
+        except Exception as e:
+            log(st, f"WORKTREE {key} reparent failed — {e}")
     templates = (["brief-reopen.md"] if rnd > 1 else []) + ["brief-coordinator.md"]
     brief = render(st, st.p("briefs", f"{key}.md"), templates, key, {"WORKTREE": wt, "ROUND": rnd})
     for duties in ("worker-duties.md", "screen-duties.md"):
